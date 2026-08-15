@@ -149,6 +149,56 @@ class MixAudioParams:
     format: str = "wav"
 
 
+@dataclass
+class SceneSegmentSpec:
+    """A single scene's rendering specification for segment-based composition.
+
+    Each scene is rendered as an independent video segment (background +
+    overlays scoped to that scene's duration), then adjacent segments are
+    joined with transitions. ``duration_sec`` is the scene's own length
+    (before any transition overlap).
+    """
+
+    scene_id: str
+    duration_sec: float
+    background_color: str = "#1a1a2e"
+    background_image: str | None = None
+    overlays: list[OverlayLayer] = field(default_factory=list)
+
+
+@dataclass
+class TransitionSpec:
+    """A transition between two adjacent scene segments.
+
+    ``kind`` maps to an FFmpeg xfade transition (or ``cut`` for a hard join).
+    ``duration_sec`` is the cross-fade overlap; it must be shorter than both
+    adjacent scenes. ``direction`` applies to slide/wipe kinds.
+    """
+
+    kind: str
+    duration_sec: float = 0.5
+    direction: str = "left"
+
+
+@dataclass
+class ComposeWithTransitionsParams:
+    """Parameters for composing a multi-scene video with real transitions.
+
+    Scene segments are rendered individually, then joined with xfade
+    transitions. The mixed audio (Phase 5B) is muxed onto the final video.
+    All paths are validated; no input is fabricated.
+    """
+
+    output_path: str
+    segments: list[SceneSegmentSpec] = field(default_factory=list)
+    transitions: list[TransitionSpec] = field(default_factory=list)
+    width: int = 1920
+    height: int = 1080
+    fps: float = 30.0
+    audio_path: str | None = None
+    format: str = "mp4"
+
+
 class FFmpegService(ABC):
     """Abstract media processing service backed by FFmpeg."""
 
@@ -177,6 +227,17 @@ class FFmpegService(ABC):
         """
         raise AppError(
             "audio mixing is not available in this environment",
+            code="NOT_IMPLEMENTED",
+        )
+
+    async def compose_with_transitions(self, params: ComposeWithTransitionsParams) -> str:
+        """Compose a multi-scene video with real transitions between segments.
+
+        Default implementation is unavailable; concrete FFmpegRenderer
+        overrides this for real xfade-based transition composition.
+        """
+        raise AppError(
+            "transition composition is not available in this environment",
             code="NOT_IMPLEMENTED",
         )
 
@@ -375,6 +436,305 @@ class FFmpegRenderer(FFmpegService):
             )
         log_event(logger, "ffmpeg.mix_audio.done", output=str(output), size=output.stat().st_size)
         return str(output)
+
+    # --- transition composition (Phase 5C) ----------------------------------
+
+    # xfade transition name lookup. ``cut`` is handled separately (concat).
+    # Unsupported/map kinds fall back to ``fade``.
+    _XFADE_MAP: dict[str, str] = {
+        "fade": "fade",
+        "dissolve": "dissolve",
+        "crossfade": "fade",
+        "fade_to_black": "fadeblack",
+        "fade_from_black": "fadeblack",
+        "fadeblack": "fadeblack",
+        "fadewhite": "fadewhite",
+        "slide": "slideleft",
+        "slide_left": "slideleft",
+        "slide_right": "slideright",
+        "slide_up": "slideup",
+        "slide_down": "slidedown",
+        "wipe": "wipeleft",
+        "wipe_left": "wipeleft",
+        "wipe_right": "wiperight",
+        "wipe_up": "wipeup",
+        "wipe_down": "wipedown",
+        "zoom": "zoomin",
+        "zoomin": "zoomin",
+        "map_zoom": "zoomin",
+        "map_to_map": "fade",
+    }
+    _XFADE_DIRECTIONS: dict[str, set[str]] = {
+        "slide": {"left", "right", "up", "down"},
+        "wipe": {"left", "right", "up", "down"},
+    }
+
+    async def compose_with_transitions(self, params: ComposeWithTransitionsParams) -> str:
+        """Compose a multi-scene video with real transitions between segments.
+
+        Each scene is rendered as an independent video segment (background +
+        that scene's overlays, scoped to the scene's duration), then adjacent
+        segments are joined with FFmpeg ``xfade`` transitions (or a hard cut).
+        The mixed audio (Phase 5B) is muxed onto the final video.
+
+        Falls back gracefully: very short scenes reduce the transition
+        duration; unsupported transition kinds fall back to ``cut``. All paths
+        are validated; no input is fabricated. Temp segment files are cleaned
+        up after successful composition.
+        """
+        if not params.segments:
+            raise RenderError("compose_with_transitions requires at least one segment")
+        output = self._validate_output_path(params.output_path)
+        warnings: list[str] = []
+
+        # Validate and normalize transitions against scene boundaries.
+        norm_transitions = self._normalize_transitions(params, warnings)
+
+        # Render each scene as a short video-only segment.
+        segment_paths: list[str] = []
+        try:
+            for i, seg in enumerate(params.segments):
+                seg_path = self._render_segment(seg, i, params, output.parent)
+                segment_paths.append(seg_path)
+
+            # Build the final xfade command (or plain concat for all-cut).
+            cmd = self._build_transition_command(
+                segment_paths, norm_transitions, params, output, warnings,
+            )
+            log_event(
+                logger, "ffmpeg.compose_transitions.start", output=str(output),
+                segments=len(segment_paths), transitions=len(norm_transitions),
+            )
+            result = self._run_subprocess(cmd)
+            if result.returncode != 0:
+                raise RenderError(
+                    f"ffmpeg transition compose failed (exit {result.returncode}): {result.stderr[:800]}",
+                    details={"output": str(output), "stderr": result.stderr[:2000]},
+                )
+            if not output.exists():
+                raise RenderError(
+                    f"ffmpeg reported success but output file not found: {output}",
+                    details={"output": str(output)},
+                )
+        except FileNotFoundError as exc:
+            raise AppError(
+                f"ffmpeg binary not found at '{self.ffmpeg_bin}'",
+                code="FFMPEG_NOT_FOUND",
+            ) from exc
+        finally:
+            # Clean up temp segment files regardless of success/failure.
+            for sp in segment_paths:
+                try:
+                    os.remove(sp)
+                except OSError:
+                    pass
+
+        log_event(
+            logger, "ffmpeg.compose_transitions.done", output=str(output),
+            size=output.stat().st_size, warnings=warnings,
+        )
+        return str(output)
+
+    def _normalize_transitions(
+        self, params: ComposeWithTransitionsParams, warnings: list[str],
+    ) -> list[TransitionSpec]:
+        """Validate transitions against scene durations; fall back to cut when unsafe.
+
+        A transition's duration must be shorter than both adjacent scenes. If a
+        scene is too short, the transition duration is clamped (or converted to
+        a cut). Unsupported kinds fall back to cut with a warning.
+        """
+        n = len(params.segments)
+        # We need n-1 transitions; pad/trim the supplied list.
+        supplied = params.transitions[: max(0, n - 1)]
+        normalized: list[TransitionSpec] = []
+        for i, t in enumerate(supplied):
+            kind = t.kind
+            dur = t.duration_sec
+            # Resolve kind to a supported xfade transition.
+            xfade_name = self._XFADE_MAP.get(kind)
+            if kind == "cut":
+                normalized.append(TransitionSpec(kind="cut", duration_sec=0.0, direction=t.direction))
+                continue
+            if xfade_name is None:
+                warnings.append(
+                    f"transition {i} kind '{kind}' is unsupported; falling back to cut"
+                )
+                normalized.append(TransitionSpec(kind="cut", duration_sec=0.0, direction=t.direction))
+                continue
+            # Clamp duration to be shorter than both adjacent scenes.
+            left_dur = params.segments[i].duration_sec
+            right_dur = params.segments[i + 1].duration_sec
+            min_scene = min(left_dur, right_dur)
+            max_allowed = min_scene * 0.5
+            if dur <= 0:
+                warnings.append(f"transition {i} has non-positive duration; using cut")
+                normalized.append(TransitionSpec(kind="cut", duration_sec=0.0, direction=t.direction))
+                continue
+            if dur >= min_scene:
+                if max_allowed >= 0.1:
+                    warnings.append(
+                        f"transition {i} duration {dur}s >= scene {i} duration {min_scene}s; "
+                        f"clamped to {max_allowed:.3f}s"
+                    )
+                    dur = round(max_allowed, 3)
+                else:
+                    warnings.append(
+                        f"scene {i} too short ({min_scene}s) for transition; using cut"
+                    )
+                    normalized.append(TransitionSpec(kind="cut", duration_sec=0.0, direction=t.direction))
+                    continue
+            # Validate direction for slide/wipe.
+            direction = t.direction
+            base = kind.split("_")[0] if "_" in kind else kind
+            if base in self._XFADE_DIRECTIONS and direction not in self._XFADE_DIRECTIONS[base]:
+                direction = "left"
+                warnings.append(f"transition {i} invalid direction; defaulting to left")
+            normalized.append(TransitionSpec(kind=kind, duration_sec=dur, direction=direction))
+        # Pad missing transitions with a default fade (only when n > 1).
+        while len(normalized) < n - 1:
+            normalized.append(TransitionSpec(kind="fade", duration_sec=0.5))
+        return normalized
+
+    def _render_segment(
+        self, seg: SceneSegmentSpec, index: int,
+        params: ComposeWithTransitionsParams, out_dir: Path,
+    ) -> str:
+        """Render a single scene as a short video-only MP4 segment.
+
+        Reuses the existing compose filtergraph logic scoped to one scene's
+        duration. Overlays are shifted to be relative to the segment start.
+        """
+        seg_name = f"_seg_{index}_{seg.scene_id}.mp4"
+        seg_output = restrict_to_directory(seg_name, out_dir)
+        # Build a ComposeVideoParams for this single segment (no audio —
+        # audio is muxed in the final transition step).
+        seg_params = ComposeVideoParams(
+            output_path=str(seg_output.relative_to(out_dir)) if seg_output.parent == out_dir else seg_name,
+            width=params.width,
+            height=params.height,
+            fps=params.fps,
+            duration_sec=seg.duration_sec,
+            background_color=seg.background_color,
+            background_image=seg.background_image,
+            overlays=seg.overlays,
+            audio_path=None,
+            video_filter=None,
+            format="mp4",
+        )
+        # _build_compose_command validates paths and builds the argv. We pass
+        # the validated output path directly.
+        validated_output = restrict_to_directory(seg_name, out_dir)
+        cmd = self._build_compose_command(seg_params, validated_output)
+        result = self._run_subprocess(cmd)
+        if result.returncode != 0:
+            raise RenderError(
+                f"segment {index} render failed (exit {result.returncode}): {result.stderr[:600]}",
+                details={"segment": seg.scene_id, "stderr": result.stderr[:1500]},
+            )
+        if not validated_output.exists():
+            raise RenderError(f"segment {index} output not found: {validated_output}")
+        return str(validated_output)
+
+    def _build_transition_command(
+        self,
+        segment_paths: list[str],
+        transitions: list[TransitionSpec],
+        params: ComposeWithTransitionsParams,
+        output: Path,
+        warnings: list[str],
+    ) -> list[str]:
+        """Build the ffmpeg argv that joins segments with xfade transitions.
+
+        For a single segment, it is re-muxed with audio. For multiple segments,
+        an xfade chain joins them; a final audio input is muxed onto the result.
+
+        xfade offset formula: for transition *i* joining the running output with
+        segment *i+1*, ``offset = cumulative - duration`` where ``cumulative`` is
+        the output length up to that point. After each xfade the output shrinks
+        by the transition duration.
+        """
+        cmd: list[str] = [self.ffmpeg_bin, "-y"]
+        # Validate + add all segment inputs.
+        for sp in segment_paths:
+            safe = self._validate_input_path(sp, must_exist=True)
+            cmd.extend(["-i", str(safe)])
+        # Audio input (optional).
+        audio_map_label: str | None = None
+        if params.audio_path:
+            audio_path = self._validate_input_path(params.audio_path, must_exist=True)
+            cmd.extend(["-i", str(audio_path)])
+            audio_map_label = f"{len(segment_paths)}:a"
+
+        n = len(segment_paths)
+        # Single segment: just map video (+ audio).
+        if n == 1:
+            cmd.extend(["-map", "0:v"])
+            if audio_map_label:
+                cmd.extend(["-map", audio_map_label])
+            cmd.extend(self._output_encoding_args(params))
+            if audio_map_label:
+                cmd.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
+            cmd.append(str(output))
+            return cmd
+
+        # Multiple segments: build the xfade chain.
+        seg_durations = [s.duration_sec for s in params.segments]
+        filter_parts: list[str] = []
+        prev_label = "[0:v]"
+        # cumulative = output length contributed by segments processed so far.
+        cumulative = seg_durations[0]
+        for i, t in enumerate(transitions):
+            if t.kind == "cut" or t.duration_sec <= 0:
+                # xfade requires duration > 0; a hard cut is emulated with a
+                # short cross-fade so the chain stays valid. 0.1s avoids the
+                # edge case where a 1-frame xfade fails to overlap correctly.
+                warnings.append(
+                    f"transition {i} is a cut; using 0.1s cross-fade for concat safety"
+                )
+                dur = 0.1
+                xfade_name = "fade"
+            else:
+                dur = t.duration_sec
+                xfade_name = self._XFADE_MAP[t.kind]
+                # Apply direction suffix for slide/wipe (e.g. slideleft).
+                base = t.kind.split("_")[0] if "_" in t.kind else t.kind
+                if base in self._XFADE_DIRECTIONS:
+                    xfade_name = base + t.direction
+            offset = round(cumulative - dur, 3)
+            if offset < 0:
+                offset = 0.0
+                warnings.append(f"transition {i} offset clamped to 0 (negative)")
+            next_label = f"[vt{i}]" if i < len(transitions) - 1 else "[vout]"
+            filter_parts.append(
+                f"{prev_label}[{i + 1}:v]xfade=transition={xfade_name}"
+                f":duration={dur}:offset={offset}{next_label}"
+            )
+            prev_label = next_label
+            # Output grows by the next segment, minus this transition's overlap.
+            cumulative = offset + seg_durations[i + 1]
+
+        filtergraph = ";".join(filter_parts)
+        cmd.extend(["-filter_complex", filtergraph])
+        cmd.extend(["-map", "[vout]"])
+        if audio_map_label:
+            cmd.extend(["-map", audio_map_label])
+        cmd.extend(self._output_encoding_args(params))
+        if audio_map_label:
+            cmd.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
+        cmd.append(str(output))
+        return cmd
+
+    @staticmethod
+    def _output_encoding_args(params: ComposeWithTransitionsParams) -> list[str]:
+        """Standard output encoding args for 1920x1080 H.264 yuv420p."""
+        return [
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            "-r", str(params.fps),
+            "-s", f"{params.width}x{params.height}",
+        ]
 
     def _build_mix_audio_command(self, params: MixAudioParams, output: Path) -> list[str]:
         """Build the ffmpeg argv for mixing voiceover + SFX + music.

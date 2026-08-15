@@ -29,6 +29,8 @@ from app.core.result import Result
 from app.mcp.schemas import (
     ComposeVideoInput,
     ComposeVideoOutput,
+    ComposeWithTransitionsInput,
+    ComposeWithTransitionsOutput,
     CreateRenderJobInput,
     CreateRenderJobOutput,
     GetRenderStatusInput,
@@ -41,9 +43,12 @@ from app.mcp.schemas import (
 from app.mcp.servers.base import BaseMcpServer, ToolDefinition
 from app.services.ffmpeg import (
     ComposeVideoParams,
+    ComposeWithTransitionsParams,
     FFmpegService,
     OverlayLayer,
     RenderJobParams,
+    SceneSegmentSpec,
+    TransitionSpec,
     get_ffmpeg_service,
 )
 from app.utils.ids import new_id
@@ -92,6 +97,14 @@ class RenderMcpServer(BaseMcpServer):
             input_schema=ComposeVideoInput,
             output_schema=ComposeVideoOutput,
             handler=self._compose_video,
+            tags={"write"},
+        ))
+        self._register_tool(ToolDefinition(
+            name="compose_with_transitions",
+            description="Compose a multi-scene video joined by real FFmpeg xfade transitions between scene segments.",
+            input_schema=ComposeWithTransitionsInput,
+            output_schema=ComposeWithTransitionsOutput,
+            handler=self._compose_with_transitions,
             tags={"write"},
         ))
         self._register_tool(ToolDefinition(
@@ -228,17 +241,10 @@ class RenderMcpServer(BaseMcpServer):
         overlays: list[OverlayLayer] = []
         if inp.overlays:
             for ov in inp.overlays:
-                try:
-                    overlays.append(OverlayLayer(
-                        image_path=ov["image_path"],
-                        x=float(ov.get("x", 0.0)),
-                        y=float(ov.get("y", 0.0)),
-                        start_time=float(ov.get("start_time", 0.0)),
-                        end_time=float(ov["end_time"]) if ov.get("end_time") is not None else None,
-                        opacity=float(ov.get("opacity", 1.0)),
-                    ))
-                except (KeyError, TypeError, ValueError) as exc:
-                    return Result.fail(f"invalid overlay: {exc}")
+                parsed = self._parse_overlay(ov)
+                if isinstance(parsed, str):
+                    return Result.fail(parsed)
+                overlays.append(parsed)
 
         bg_color = inp.background_color if inp.background_color.startswith("#") else f"#{inp.background_color}"
 
@@ -287,6 +293,137 @@ class RenderMcpServer(BaseMcpServer):
             job["error"] = str(exc)
             log_event(logger, "compose.failed", job_id=job_id, error=str(exc))
             return Result.fail(f"compose failed unexpectedly: {exc}")
+
+    async def _compose_with_transitions(
+        self, inp: ComposeWithTransitionsInput,
+    ) -> Result[ComposeWithTransitionsOutput]:
+        """Compose a multi-scene video joined by real FFmpeg xfade transitions.
+
+        Each scene segment is rendered independently (background + overlays
+        scoped to the scene), then adjacent segments are joined with xfade
+        transitions. The mixed audio (Phase 5B) is muxed onto the final video.
+        Falls back gracefully: unsupported transition kinds and overly long
+        durations are clamped/converted to cut by the renderer.
+        """
+        job_id = new_id("compose_trans_")
+        warnings: list[str] = []
+        output_filename = inp.output_filename
+        if not output_filename.lower().endswith(f".{inp.format}"):
+            output_filename = f"{output_filename}.{inp.format}"
+
+        # Parse scene segments.
+        segments: list[SceneSegmentSpec] = []
+        for seg in inp.segments:
+            try:
+                seg_overlays: list[OverlayLayer] = []
+                for ov in (seg.get("overlays") or []):
+                    parsed = self._parse_overlay(ov)
+                    if isinstance(parsed, str):
+                        return Result.fail(parsed)
+                    seg_overlays.append(parsed)
+                bg = seg.get("background_color", "#1a1a2e")
+                bg = bg if str(bg).startswith("#") else f"#{bg}"
+                segments.append(SceneSegmentSpec(
+                    scene_id=seg["scene_id"],
+                    duration_sec=float(seg["duration_sec"]),
+                    background_color=bg,
+                    background_image=seg.get("background_image"),
+                    overlays=seg_overlays,
+                ))
+            except (KeyError, TypeError, ValueError) as exc:
+                return Result.fail(f"invalid segment: {exc}")
+
+        # Parse transitions.
+        transitions: list[TransitionSpec] = []
+        for t in (inp.transitions or []):
+            try:
+                transitions.append(TransitionSpec(
+                    kind=t.get("kind", "fade"),
+                    duration_sec=float(t.get("duration_sec", 0.5)),
+                    direction=t.get("direction", "left"),
+                ))
+            except (TypeError, ValueError) as exc:
+                return Result.fail(f"invalid transition: {exc}")
+
+        job = {
+            "job_id": job_id,
+            "project_id": inp.project_id,
+            "status": RenderJobStatus.RUNNING.value,
+            "output_path": output_filename,
+            "error": None,
+        }
+        self._jobs[job_id] = job
+        log_event(
+            logger, "compose_transitions.started", job_id=job_id,
+            segments=len(segments), transitions=len(transitions),
+        )
+
+        # Compute the expected final video duration: sum of segment durations
+        # minus the sum of transition overlaps (cuts contribute ~0 overlap).
+        total_seg = sum(s.duration_sec for s in segments)
+        expected_dur = total_seg
+        if len(segments) > 1 and transitions:
+            # Only count transitions that will actually overlap (non-cut, > 0).
+            n_trans = min(len(transitions), len(segments) - 1)
+            overlap = sum(
+                t.duration_sec for t in transitions[:n_trans]
+                if t.kind != "cut" and t.duration_sec > 0
+            )
+            expected_dur = total_seg - overlap
+        warnings.append(
+            f"expected output duration ~{expected_dur:.3f}s "
+            f"({len(segments)} segments, {min(len(transitions), max(0, len(segments) - 1))} transitions)"
+        )
+
+        try:
+            params = ComposeWithTransitionsParams(
+                output_path=output_filename,
+                segments=segments,
+                transitions=transitions,
+                width=inp.width,
+                height=inp.height,
+                fps=inp.fps,
+                audio_path=inp.audio_path,
+                format=inp.format,
+            )
+            output_path = await self.ffmpeg.compose_with_transitions(params)
+            job["status"] = RenderJobStatus.COMPLETED.value
+            job["output_path"] = output_path
+            log_event(logger, "compose_transitions.completed", job_id=job_id, output=output_path)
+            return Result.ok(ComposeWithTransitionsOutput(
+                job_id=job_id,
+                status=RenderJobStatus.COMPLETED.value,
+                output_path=output_path,
+                segment_count=len(segments),
+                transition_count=min(len(transitions), max(0, len(segments) - 1)),
+                duration_sec=expected_dur,
+                warnings=warnings,
+            ))
+        except (AppError, RenderError) as exc:
+            job["status"] = RenderJobStatus.FAILED.value
+            job["error"] = str(exc)
+            log_event(logger, "compose_transitions.failed", job_id=job_id, error=str(exc))
+            return Result.fail(f"compose_with_transitions failed: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = RenderJobStatus.FAILED.value
+            job["error"] = str(exc)
+            log_event(logger, "compose_transitions.failed", job_id=job_id, error=str(exc))
+            return Result.fail(f"compose_with_transitions failed unexpectedly: {exc}")
+
+    @staticmethod
+    def _parse_overlay(ov: dict[str, Any]) -> OverlayLayer | str:
+        """Parse an overlay dict into an OverlayLayer, or return an error string."""
+        try:
+            return OverlayLayer(
+                image_path=ov["image_path"],
+                x=float(ov.get("x", 0.0)),
+                y=float(ov.get("y", 0.0)),
+                start_time=float(ov.get("start_time", 0.0)),
+                end_time=float(ov["end_time"]) if ov.get("end_time") is not None else None,
+                opacity=float(ov.get("opacity", 1.0)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return f"invalid overlay: {exc}"
 
     # --- legacy -------------------------------------------------------------
 

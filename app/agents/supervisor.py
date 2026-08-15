@@ -385,23 +385,33 @@ class SupervisorAgent:
         state = self._advance_state(state, WorkflowStateEnum.GENERATING_TEXT)
 
         # Step 7: Transitions MCP — create transitions between scenes.
+        # The transition kind is derived from each scene's transition_type
+        # (set by the Script MCP) and mapped to a renderable FFmpeg xfade kind.
         transitions: list[dict[str, Any]] = []
         scenes = context["scenes"]
         for i in range(1, len(scenes)):
             prev = scenes[i - 1]
             curr = scenes[i]
+            # Derive the transition kind from the *incoming* scene's type, then
+            # map it to a kind the Transitions/Render MCP servers understand.
+            raw_type = curr.get("transition_type") or prev.get("transition_type") or "fade"
+            kind = _map_transition_kind(raw_type)
             trans_result = await self.run_agent(
                 AgentName.TRANSITION, "create_transition",
                 {
                     "from_scene_id": prev.get("id"),
                     "to_scene_id": curr.get("id"),
-                    "kind": "fade",
+                    "kind": kind,
                     "duration_sec": 0.5,
                     "start_time": prev.get("end_time", 0.0),
                 },
             )
             if trans_result.success and trans_result.output:
-                transitions.append(trans_result.output.get("transition", {}))
+                t = trans_result.output.get("transition", {})
+                # Carry the renderable kind + direction through to composition.
+                t["kind"] = kind
+                t["direction"] = "left"
+                transitions.append(t)
         results["transitions"] = AgentResult(
             agent=AgentName.TRANSITION,
             status="success",
@@ -486,75 +496,160 @@ class SupervisorAgent:
         state = self._advance_state(state, WorkflowStateEnum.GENERATING_SOUND)
 
         # Step 9: Render MCP — compose the final video with overlays.
-        # Build overlay list: map PNGs first (as full-frame-ish backgrounds for
-        # their scenes), then text overlays on top. Map overlays are timed to
-        # their scene intervals so each map only appears during its scene.
-        compose_overlays: list[dict[str, Any]] = []
+        # Phase 5C: when there are ≥2 scenes and planned transitions, render
+        # each scene as an independent segment and join them with real FFmpeg
+        # xfade transitions (compose_with_transitions). This preserves Phase 5A
+        # map overlays (scoped per scene) and Phase 5B mixed audio (muxed onto
+        # the final video). Falls back to the single continuous compose_video
+        # when transitions are absent or composition fails.
         scene_map_paths = context.get("scene_map_paths", {})
         scenes = context.get("scenes", [])
+        transitions = context.get("transitions", [])
+        duration = context["audio_duration_sec"] or total_duration_sec
+
+        # Build per-scene overlay lists (map PNG + text PNG), with times
+        # relative to each scene's own segment start (0-based within segment).
+        scene_segments: list[dict[str, Any]] = []
         for scene in scenes:
             sidx = scene.get("index", 0)
+            seg_overlays: list[dict[str, Any]] = []
             map_path = scene_map_paths.get(sidx)
             if map_path:
-                compose_overlays.append({
+                seg_overlays.append({
                     "image_path": map_path,
-                    "x": 0.0,
-                    "y": 0.0,
-                    "start_time": float(scene.get("start_time", 0.0)),
-                    "end_time": float(scene.get("end_time", 5.0)),
+                    "x": 0.0, "y": 0.0,
+                    "start_time": 0.0,
+                    "end_time": float(scene.get("duration", scene.get("end_time", 5.0)) - scene.get("start_time", 0.0)),
                     "opacity": 1.0,
                 })
-        for overlay in text_overlays:
-            rendered_path = overlay.get("rendered_path")
-            if rendered_path:
-                compose_overlays.append({
-                    "image_path": rendered_path,
-                    "x": 0.1,
-                    "y": 0.05,
-                    "start_time": overlay.get("start_time", 0.0),
-                    "end_time": overlay.get("end_time", 5.0),
-                })
-        duration = context["audio_duration_sec"] or total_duration_sec
-        compose_args: dict[str, Any] = {
-            "project_id": project_id,
-            "output_filename": f"{project_id}.mp4",
-            "duration_sec": duration,
-            "width": 1920,
-            "height": 1080,
-            "fps": 30.0,
-            "background_color": "#1a1a2e",
-            "overlays": compose_overlays,
-        }
-        if mixed_audio_path:
-            # Use the mixed audio track (voiceover + SFX + music) so all
-            # sound layers reach the final MP4. Falls back to raw voiceover
-            # when mixing was unavailable.
-            compose_args["audio_path"] = mixed_audio_path
-        elif voiceover_path:
-            compose_args["audio_path"] = voiceover_path
-        compose_result = await self.run_agent(AgentName.RENDER, "compose_video", compose_args)
-        results["render"] = compose_result
-        render_output_path = None
-        if compose_result.success and compose_result.output:
-            render_output_path = compose_result.output.get("output_path")
-        elif not compose_result.success:
-            # Compose failed (e.g., StubFFmpegService in test env). Fall back
-            # to the basic render_video tool so the workflow can still produce
-            # a video in environments with ffmpeg but without compose support.
-            fallback_result = await self.run_agent(
-                AgentName.RENDER, "create_render_job",
-                {
-                    "project_id": project_id,
-                    "output_filename": f"{project_id}_fallback.mp4",
-                    "duration_sec": duration,
-                },
+            for overlay in text_overlays:
+                # Attach a text overlay to the scene it belongs to (by timing).
+                if overlay.get("scene_id") == scene.get("id"):
+                    rendered_path = overlay.get("rendered_path")
+                    if rendered_path:
+                        seg_start = float(scene.get("start_time", 0.0))
+                        ov_start = float(overlay.get("start_time", 0.0)) - seg_start
+                        ov_end = float(overlay.get("end_time", 5.0)) - seg_start
+                        seg_overlays.append({
+                            "image_path": rendered_path,
+                            "x": 0.1, "y": 0.05,
+                            "start_time": max(0.0, ov_start),
+                            "end_time": max(0.0, ov_end),
+                        })
+            scene_dur = float(scene.get("duration", 0.0)) or (
+                float(scene.get("end_time", 0.0)) - float(scene.get("start_time", 0.0))
             )
-            if fallback_result.success and fallback_result.output:
-                job_id = fallback_result.output.get("job_id")
-                render_result = await self.run_agent(AgentName.RENDER, "render_video", {"job_id": job_id})
-                results["render_fallback"] = render_result
-                if render_result.success and render_result.output:
-                    render_output_path = render_result.output.get("output_path")
+            scene_segments.append({
+                "scene_id": scene.get("id", f"scene_{sidx}"),
+                "duration_sec": scene_dur,
+                "background_color": "#1a1a2e",
+                "overlays": seg_overlays,
+            })
+
+        # Transition specs for the compose_with_transitions tool.
+        trans_specs: list[dict[str, Any]] = [
+            {
+                "kind": t.get("kind", "fade"),
+                "duration_sec": float(t.get("duration_sec", 0.5)),
+                "direction": t.get("direction", "left"),
+            }
+            for t in transitions
+        ]
+
+        render_output_path: str | None = None
+        used_transition_compose = False
+        # Use transition composition when we have ≥2 scenes and transitions.
+        if len(scene_segments) >= 2 and trans_specs:
+            trans_audio = mixed_audio_path or voiceover_path
+            trans_args: dict[str, Any] = {
+                "project_id": project_id,
+                "output_filename": f"{project_id}.mp4",
+                "segments": scene_segments,
+                "transitions": trans_specs,
+                "width": 1920,
+                "height": 1080,
+                "fps": 30.0,
+            }
+            if trans_audio:
+                trans_args["audio_path"] = trans_audio
+            trans_result = await self.run_agent(
+                AgentName.RENDER, "compose_with_transitions", trans_args,
+            )
+            results["render"] = trans_result
+            if trans_result.success and trans_result.output:
+                render_output_path = trans_result.output.get("output_path")
+                used_transition_compose = True
+            else:
+                logger.warning(
+                    "supervisor.transition_compose.failed_fallback",
+                    extra={"project_id": project_id, "errors": trans_result.errors},
+                )
+
+        # Fall back to (or use directly) the continuous single-video compose.
+        if render_output_path is None:
+            compose_overlays: list[dict[str, Any]] = []
+            for scene in scenes:
+                sidx = scene.get("index", 0)
+                map_path = scene_map_paths.get(sidx)
+                if map_path:
+                    compose_overlays.append({
+                        "image_path": map_path,
+                        "x": 0.0, "y": 0.0,
+                        "start_time": float(scene.get("start_time", 0.0)),
+                        "end_time": float(scene.get("end_time", 5.0)),
+                        "opacity": 1.0,
+                    })
+            for overlay in text_overlays:
+                rendered_path = overlay.get("rendered_path")
+                if rendered_path:
+                    compose_overlays.append({
+                        "image_path": rendered_path,
+                        "x": 0.1, "y": 0.05,
+                        "start_time": overlay.get("start_time", 0.0),
+                        "end_time": overlay.get("end_time", 5.0),
+                    })
+            compose_args: dict[str, Any] = {
+                "project_id": project_id,
+                "output_filename": f"{project_id}.mp4",
+                "duration_sec": duration,
+                "width": 1920,
+                "height": 1080,
+                "fps": 30.0,
+                "background_color": "#1a1a2e",
+                "overlays": compose_overlays,
+            }
+            if mixed_audio_path:
+                # Use the mixed audio track (voiceover + SFX + music) so all
+                # sound layers reach the final MP4. Falls back to raw voiceover
+                # when mixing was unavailable.
+                compose_args["audio_path"] = mixed_audio_path
+            elif voiceover_path:
+                compose_args["audio_path"] = voiceover_path
+            compose_result = await self.run_agent(AgentName.RENDER, "compose_video", compose_args)
+            if not used_transition_compose:
+                results["render"] = compose_result
+            else:
+                results["render_fallback"] = compose_result
+            if compose_result.success and compose_result.output:
+                render_output_path = compose_result.output.get("output_path")
+            elif not compose_result.success:
+                # Compose failed (e.g., StubFFmpegService in test env). Fall back
+                # to the basic render_video tool so the workflow can still produce
+                # a video in environments with ffmpeg but without compose support.
+                fallback_result = await self.run_agent(
+                    AgentName.RENDER, "create_render_job",
+                    {
+                        "project_id": project_id,
+                        "output_filename": f"{project_id}_fallback.mp4",
+                        "duration_sec": duration,
+                    },
+                )
+                if fallback_result.success and fallback_result.output:
+                    job_id = fallback_result.output.get("job_id")
+                    render_result = await self.run_agent(AgentName.RENDER, "render_video", {"job_id": job_id})
+                    results["render_fallback"] = render_result
+                    if render_result.success and render_result.output:
+                        render_output_path = render_result.output.get("output_path")
         state = self._advance_state(state, WorkflowStateEnum.RENDERING)
 
         # Step 10: QA MCP — create QA report.
@@ -688,6 +783,29 @@ class SupervisorAgent:
                 agent=AgentName.QA, status="failed", success=False, errors=["QA not run"]
             )).output,
         }
+
+
+def _map_transition_kind(raw: str) -> str:
+    """Map a scene's ``transition_type`` to a renderable FFmpeg xfade kind.
+
+    The Script MCP emits narrative kinds (fade/dissolve); this maps them (and
+    any synonyms) to the kinds understood by the Transitions/Render MCP
+    servers. Unknown kinds fall back to ``fade`` so rendering always proceeds.
+    """
+    mapping = {
+        "fade": "fade",
+        "dissolve": "dissolve",
+        "crossfade": "fade",
+        "cut": "cut",
+        "slide": "slide",
+        "wipe": "wipe",
+        "zoom": "zoom",
+        "fade_to_black": "fade_to_black",
+        "fadeblack": "fade_to_black",
+        "map_zoom": "map_zoom",
+        "map_to_map": "map_to_map",
+    }
+    return mapping.get(str(raw).strip().lower(), "fade")
 
 
 def _next_phase(current: WorkflowPhase) -> WorkflowPhase:

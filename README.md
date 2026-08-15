@@ -311,6 +311,47 @@ Key guarantees enforced through the architecture:
 **380 tests** (all passing), covering the full architecture, all 9 servers,
 real FFmpeg rendering, DB persistence, guardrails, CLI, API, and e2e pipeline.
 
+
+### Phase 5 — multi-layer production pipeline (in progress)
+
+**Phase 5A — Map rendering (complete)**: `MapAnimationEngine` renders real
+map PNGs from geocoded coordinates with zoom/pan animations. Maps are
+composited into the final video as timed overlays scoped to their scenes.
+
+**Phase 5B — Sound mixing (complete)**: the Sound MCP server's `mix_audio`
+tool combines voiceover, timed SFX, and music into a single mixed audio
+track via FFmpeg's `amix`/`adelay` filters. The mixed track is muxed into
+the final MP4.
+
+**Phase 5C — Real video transitions (complete)**: the Transitions MCP
+server and FFmpeg pipeline now produce real cross-scene video transitions
+using FFmpeg's `xfade` filter. Each scene is rendered as an independent
+segment (background + map overlays + text), then adjacent segments are
+joined by a configurable transition (fade, dissolve, slide, wipe, zoom,
+fade-to-black). The Phase 5B mixed audio is muxed onto the final video.
+Key components:
+
+- `FFmpegRenderer.compose_with_transitions()` renders each segment, builds
+  an `xfade` filtergraph chain with correct per-transition offsets, and muxes
+  audio. Unsupported transition kinds fall back to a cut; oversized
+  transition durations are clamped to 50% of the shorter adjacent segment.
+- `compose_with_transitions` tool in the Render MCP server exposes the
+  transition composition pipeline as a schema-validated MCP tool.
+- `build_filtergraph` tool in the Transitions MCP server generates real
+  `xfade` filtergraph strings for a given transition kind, direction, and
+  offset.
+- Supervisor Step 7 derives a renderable transition kind from each scene's
+  `transition_type`; Step 9 routes through `compose_with_transitions` when
+  there are 2+ scenes and transitions, falling back to continuous
+  `compose_video` on failure (preserving Phase 5A/5B behavior).
+- Output duration reflects transition overlaps (e.g. 4 scenes x 2.5s with
+  3 x 0.5s transitions produces an 8.5s final video).
+
+**442 tests** (all passing), including 23 Phase 5C tests exercising schemas,
+filtergraph generation, transition normalization/clamping, the Render MCP
+tool, supervisor wiring, and a full real-ffmpeg e2e pipeline that produces a
+1920x1080 H.264 MP4 joined by xfade transitions with QA passing.
+
 ---
 
 ## MCP architecture
@@ -365,7 +406,7 @@ state machine tracks lifecycle; the supervisor can persist results through
 ### Testing
 
 ```
-python -m pytest           # 362 passed, 2 skipped
+python -m pytest           # 442 passed
 python -m compileall app tests
 ```
 

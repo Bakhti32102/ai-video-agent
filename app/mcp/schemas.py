@@ -545,6 +545,59 @@ class ComposeVideoOutput(ToolOutput):
     warnings: list[str] = Field(default_factory=list)
 
 
+class SceneSegmentInput(ToolInput):
+    """A single scene segment for transition-based composition."""
+
+    scene_id: str = Field(pattern=r"^[A-Za-z0-9_\-]{1,64}$")
+    duration_sec: float = Field(gt=0.0, le=600.0)
+    background_color: str = Field(default="#1a1a2e", pattern=r"^#?[0-9A-Fa-f]{6}$")
+    background_image: str | None = None
+    overlays: list[dict[str, Any]] | None = None
+
+
+class TransitionInput(ToolInput):
+    """A transition between two adjacent scene segments.
+
+    ``kind`` maps to an FFmpeg xfade transition (cut|fade|dissolve|fade_to_black|
+    slide|wipe|zoom) or falls back to cut when unsupported. ``direction`` applies
+    to slide/wipe (left|right|up|down).
+    """
+
+    kind: str = Field(default="fade")
+    duration_sec: float = Field(default=0.5, gt=0.0, le=5.0)
+    direction: str = Field(default="left", pattern=r"^(left|right|up|down)$")
+
+
+class ComposeWithTransitionsInput(ToolInput):
+    """Compose a multi-scene video joined by real FFmpeg transitions.
+
+    Each scene segment is rendered independently (background + overlays scoped
+    to the scene), then adjacent segments are joined with xfade transitions.
+    The optional ``audio_path`` (mixed audio from Phase 5B) is muxed onto the
+    final video.
+    """
+
+    output_filename: str = Field(min_length=1, max_length=255)
+    project_id: str = Field(default="proj", pattern=r"^[A-Za-z0-9_\-]{1,64}$")
+    segments: list[dict[str, Any]] = Field(min_length=1)
+    transitions: list[dict[str, Any]] | None = None
+    width: int = Field(default=1920, ge=1, le=7680)
+    height: int = Field(default=1080, ge=1, le=4320)
+    fps: float = Field(default=30.0, gt=0.0, le=120.0)
+    audio_path: str | None = None
+    format: str = Field(default="mp4")
+
+
+class ComposeWithTransitionsOutput(ToolOutput):
+    job_id: str
+    status: str
+    output_path: str
+    segment_count: int
+    transition_count: int
+    duration_sec: float
+    warnings: list[str] = Field(default_factory=list)
+
+
 # === QA MCP ===
 
 
@@ -604,6 +657,7 @@ __all__ = [
     "CreateTextOverlayInput", "CreateTextOverlayOutput",
     # Transitions
     "CreateTransitionInput", "CreateTransitionOutput",
+    "BuildFiltergraphInput", "BuildFiltergraphOutput",
     # Sound
     "CreateSoundEventInput", "CreateSoundEventOutput",
     "CreateSoundDesignPlanInput", "CreateSoundDesignPlanOutput",
@@ -616,6 +670,8 @@ __all__ = [
     "RenderVideoInput", "RenderVideoOutput",
     "GetRenderStatusInput", "GetRenderStatusOutput",
     "ComposeVideoInput", "ComposeVideoOutput",
+    "SceneSegmentInput", "TransitionInput",
+    "ComposeWithTransitionsInput", "ComposeWithTransitionsOutput",
     # QA
     "ValidateProjectInput", "ValidateProjectOutput",
     "CreateQaReportInput", "CreateQaReportOutput",
