@@ -14,9 +14,13 @@ class TimelineEvent(Base, IDMixin, TimestampMixin):
 
     __tablename__ = "timeline_events"
 
-    project_id: Mapped[str] = mapped_column(String(64), ForeignKey("projects.id"), nullable=False, index=True)
-    scene_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("scenes.id"), nullable=True, index=True)
-    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    project_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scene_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("scenes.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     start_time: Mapped[float] = mapped_column(Float, nullable=False)
     end_time: Mapped[float] = mapped_column(Float, nullable=False)
     layer: Mapped[int] = mapped_column(default=0)

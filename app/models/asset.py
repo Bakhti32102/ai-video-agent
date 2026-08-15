@@ -14,16 +14,17 @@ class Asset(Base, IDMixin, TimestampMixin):
 
     __tablename__ = "assets"
 
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    asset_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    asset_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     format: Mapped[str] = mapped_column(String(16), nullable=False)
     file_path: Mapped[str] = mapped_column(String(512), nullable=False)
-    source: Mapped[str] = mapped_column(String(128), nullable=False, default="unknown")
+    source: Mapped[str] = mapped_column(String(128), nullable=False, default="unknown", index=True)
     license: Mapped[str | None] = mapped_column(String(255), nullable=True)
     width: Mapped[int | None] = mapped_column(nullable=True)
     height: Mapped[int | None] = mapped_column(nullable=True)
     duration_sec: Mapped[float | None] = mapped_column(nullable=True)
     extra_metadata: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    provenance: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     scene_links: Mapped[list["SceneAsset"]] = relationship(  # type: ignore[name-defined]  # noqa: F821
         back_populates="asset", cascade="all, delete-orphan"
@@ -38,8 +39,12 @@ class SceneAsset(Base, IDMixin, TimestampMixin):
 
     __tablename__ = "scene_assets"
 
-    scene_id: Mapped[str] = mapped_column(String(64), ForeignKey("scenes.id"), nullable=False, index=True)
-    asset_id: Mapped[str] = mapped_column(String(64), ForeignKey("assets.id"), nullable=False, index=True)
+    scene_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("scenes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    asset_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("assets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     role: Mapped[str] = mapped_column(String(64), nullable=False, default="primary")
     placement: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 

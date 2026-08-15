@@ -18,11 +18,13 @@ from app.core.enums import (
     AssetFormat,
     AssetType,
     ProjectStatus,
+    ProvenanceType,
     QASeverity,
     QACategory,
     RenderJobStatus,
     SceneStatus,
     WorkflowPhase,
+    WorkflowState as WorkflowStateEnum,
 )
 from app.schemas.validators import (
     non_empty_str,
@@ -32,6 +34,7 @@ from app.schemas.validators import (
     validate_longitude,
     utc_now_iso,
 )
+from app.utils.ids import new_id
 
 # --- common config ----------------------------------------------------------
 
@@ -48,6 +51,42 @@ class Contract(BaseModel):
     model_config = StrictModelConfig
 
 
+# --- Provenance -------------------------------------------------------------
+
+
+class Provenance(Contract):
+    """Traceability record for externally-obtained information.
+
+    Any data that did not originate inside the pipeline (geocoded coordinates,
+    downloaded assets, AI-generated content) must carry a provenance record so
+    it can be audited. Provenance is never invented — if the source is unknown
+    the owning data must be rejected by the guardrails.
+    """
+
+    provenance_type: ProvenanceType
+    provider: str = Field(min_length=1, max_length=128, description="Source provider name")
+    source: str = Field(min_length=1, max_length=512, description="Human-readable source reference")
+    query: str | None = Field(default=None, description="Original query that produced this data")
+    asset_id: str | None = Field(default=None, max_length=128)
+    license: str | None = Field(default=None, max_length=255)
+    model: str | None = Field(default=None, max_length=128, description="Model used (for AI-generated content)")
+    retrieved_at: str = Field(default_factory=utc_now_iso)
+
+    @field_validator("provider", "source")
+    @classmethod
+    def _ne(cls, v: str) -> str:
+        return non_empty_str(v)  # type: ignore[return-value]
+
+
+class GeoProvenance(Provenance):
+    """Provenance for geocoded coordinates (latitude/longitude)."""
+
+    provenance_type: ProvenanceType = ProvenanceType.GEOCODING
+    latitude: LatitudeField
+    longitude: LongitudeField
+    raw_payload: dict | None = None
+
+
 # --- Location ---------------------------------------------------------------
 
 
@@ -61,6 +100,7 @@ class Location(Contract):
     date: str | None = Field(default=None, description="Optional YYYY-MM-DD date associated with the location")
     geocode_payload: dict | None = None
     bbox: dict | None = None
+    provenance: GeoProvenance | None = None
 
     @field_validator("name", "country", "source")
     @classmethod
@@ -98,6 +138,7 @@ class Asset(Contract):
     height: int | None = Field(default=None, ge=1)
     duration_sec: float | None = None
     metadata: dict | None = None
+    provenance: Provenance | None = None
 
     @field_validator("name", "file_path", "source")
     @classmethod
@@ -348,14 +389,24 @@ class QAReport(Contract):
 
 
 class AgentResult(Contract):
-    """Structured result returned by every agent/MCP server."""
+    """Universal structured result returned by every agent/MCP server.
+
+    This is the single contract every future agent MUST return. Free-form
+    output is confined to the ``output`` payload (which is itself a dict/list
+    or None); the surrounding metadata is always structured and validated.
+    """
 
     agent: AgentName
     status: AgentRunStatus
     success: bool
+    run_id: IDField = Field(default_factory=lambda: new_id("run_"))
+    project_id: IDField | None = None
+    scene_id: IDField | None = None
     output: dict | list | None = None
     errors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="Agent self-reported confidence [0..1]")
+    provenance: Provenance | None = None
     attempt: int = Field(ge=1, default=1)
     started_at: str = Field(default_factory=utc_now_iso)
     finished_at: str | None = None
@@ -366,6 +417,8 @@ class AgentResult(Contract):
             raise ValueError("successful results must not contain errors")
         if not self.success and not self.errors:
             raise ValueError("failed results must include at least one error")
+        if self.finished_at is not None and self.started_at and self.finished_at < self.started_at:
+            raise ValueError("finished_at must not precede started_at")
         return self
 
 
@@ -402,9 +455,18 @@ class Project(Contract):
 
 
 class WorkflowState(Contract):
+    """Snapshot of a project's workflow state.
+
+    ``current_state`` uses the production :class:`app.core.enums.WorkflowState`
+    enum driven by :class:`app.core.workflow.WorkflowStateMachine`. The legacy
+    ``current_phase`` field is kept for backward compatibility with Phase 1.
+    """
+
     id: IDField
     project_id: IDField
+    current_state: WorkflowStateEnum = WorkflowStateEnum.CREATED
     current_phase: WorkflowPhase = WorkflowPhase.INIT
+    previous_state: WorkflowStateEnum | None = None
     previous_phase: WorkflowPhase | None = None
     agent_statuses: dict = Field(default_factory=dict)
     retries: dict = Field(default_factory=dict)
@@ -416,9 +478,11 @@ __all__ = [
     "Asset",
     "AudioSegment",
     "Contract",
+    "GeoProvenance",
     "Location",
     "MapAnimation",
     "Project",
+    "Provenance",
     "QAFinding",
     "QAReport",
     "RenderJob",

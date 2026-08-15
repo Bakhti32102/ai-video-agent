@@ -11,8 +11,10 @@ specialized MCP servers. It deliberately **does not** depend on Adobe After
 Effects or GEOlayers 3 and favours open-source / local technologies
 (FFmpeg, GeoJSON, SVG/HTML/Canvas, MapLibre/Leaflet).
 
-> **Status:** Phase 1 — project foundation and architecture only. The full
-> 9-agent pipeline and final video rendering are NOT implemented yet (see
+> **Status:** Phase 2 (in progress) — production-ready foundation. The core
+> infrastructure (database, schemas, guardrails, workflow state machine,
+> logging, supervisor) is now production-grade. The full 9-agent pipeline and
+> final video rendering remain Phase 3 (see
 > [Current implementation status](#current-implementation-status)).
 
 ---
@@ -204,9 +206,9 @@ Key guarantees enforced through the architecture:
 
 ---
 
-## Current implementation status (Phase 1)
+## Current implementation status (Phase 2)
 
-Implemented and tested:
+### Phase 1 — foundation (complete)
 
 - Project scaffolding, config (`pydantic-settings`), logging, exceptions,
   `Result` type.
@@ -220,9 +222,45 @@ Implemented and tested:
   `McpClient` orchestrator.
 - `BaseAgent` + `SupervisorAgent` with bounded retries and `WorkflowState`.
 - FastAPI app with `/health` and `/mcp/tools`.
-- 89 unit tests (all passing).
 
-Phase 1 server behaviour:
+### Phase 2 — production-ready foundation (in progress)
+
+- **Error hierarchy & enums**: structured `AppError` subclasses
+  (`FileSafetyError`, `GuardrailError`, etc.) with `code` and `details`;
+  new `ProvenanceType` and `WorkflowState` enums.
+- **Workflow state machine** (`app/core/workflow.py`): deterministic
+  transition validation — only explicitly-allowed transitions are accepted;
+  terminal states (`COMPLETED`, `FAILED`, `CANCELLED`) cannot transition;
+  per-project `WorkflowStateMachine` with retry tracking and history.
+- **Provenance tracking**: `Provenance` and `GeoProvenance` schemas record
+  the source, provider, and retrieval timestamp for every geo-coded location
+  and asset. No data enters the pipeline without an accountable origin.
+- **Enhanced `AgentResult`**: auto-generated `run_id`, optional `project_id`
+  / `scene_id`, `confidence` score (0.0–1.0), and `provenance` field.
+- **File safety utilities** (`app/utils/paths.py`): path-traversal detection,
+  directory-restriction enforcement, extension validation, safe `mkdir` —
+  prevents directory escapes and control-character injection.
+- **Centralized guardrail pipeline** (`app/guardrails/pipeline.py`):
+  `GuardrailPipeline` runs all rules in a single pass and produces a
+  `GuardrailReport`; `validate_before_accept` is the single entry point used
+  by the supervisor before accepting any agent result.
+- **Database production-readiness**: SQLite FK enforcement (`PRAGMA
+  foreign_keys=ON`), `ondelete=CASCADE` across all FK relationships
+  (`SET NULL` for `agent_run`), `index=True` on status/name fields, `UniqueConstraint`
+  on `(project_id, index)` for scenes, `provenance` JSON columns on `Asset`
+  and `Location`, `current_state` column on `WorkflowState`.
+- **Supervisor enhancements**: integrates the guardrail pipeline (results
+  that fail guardrails are rejected and retried), uses the workflow state
+  machine for transitions, transitions to `FAILED` when retries are exhausted,
+  emits structured event logs.
+- **Logging improvements**: `SecretRedactingFormatter` masks API keys,
+  tokens, passwords, and bearer tokens before they reach any handler;
+  `log_event` helper for structured key=value event logging.
+- **265 unit tests** (all passing) — 89 Phase 1 + 176 Phase 2 tests covering
+  the state machine, exceptions, provenance schemas, file safety, guardrail
+  pipeline, logging, and database enhancements.
+
+Phase 1 server behaviour (unchanged):
 
 - **Script** — heuristic paragraph splitter (returns scene specs).
 - **QA** — fully implemented structural checks (missing scenes/gaps, timeline
@@ -230,11 +268,11 @@ Phase 1 server behaviour:
   assets) producing a structured `QAReport`.
 - **Geo / Asset / Sound / Render** — explicit stubs that **refuse** to
   produce unverifiable output, with `TODO(Phase 2)` documentation.
-- **Audio / Text / Transition** — contract + light logic; full features Phase 2.
+- **Audio / Text / Transition** — contract + light logic; full features Phase 3.
 
 ---
 
-## What is NOT implemented yet (Phase 2+)
+## What is NOT implemented yet (Phase 3+)
 
 - LLM-driven script understanding and entity detection (NER).
 - Real audio analysis via FFmpeg/ffprobe (duration, silence, transcript).

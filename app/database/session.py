@@ -27,9 +27,22 @@ _SessionLocal: sessionmaker[Session] | None = None
 def _build_engine(settings: Settings) -> Engine:
     url = settings.database_url
     connect_args: dict = {}
-    if url.startswith("sqlite"):
+    is_sqlite = url.startswith("sqlite")
+    if is_sqlite:
         connect_args = {"check_same_thread": False}
-    return create_engine(url, connect_args=connect_args, future=True, echo=False)
+    engine = create_engine(url, connect_args=connect_args, future=True, echo=False)
+    # Enable foreign-key enforcement for SQLite (off by default).
+    # PostgreSQL enforces FKs natively.
+    if is_sqlite:
+        from sqlalchemy import event
+
+        @event.listens_for(engine, "connect")
+        def _enable_fk(dbapi_connection, connection_record):  # noqa: ARG001
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+    return engine
 
 
 def get_engine(settings: Settings | None = None) -> Engine:

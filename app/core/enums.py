@@ -125,3 +125,37 @@ class WorkflowPhase(StrEnum):
     RENDERING = "rendering"
     QA = "qa"
     DONE = "done"
+
+
+class WorkflowState(StrEnum):
+    """Production workflow states for the state machine.
+
+    These track the lifecycle of a project through the pipeline. Only
+    transitions defined in :class:`app.core.workflow.WorkflowStateMachine`
+    are valid.
+    """
+
+    CREATED = "created"
+    ANALYZING_SCRIPT = "analyzing_script"
+    ANALYZING_AUDIO = "analyzing_audio"
+    BUILDING_SCENES = "building_scenes"
+    GENERATING_MAPS = "generating_maps"
+    GENERATING_ASSETS = "generating_assets"
+    GENERATING_TEXT = "generating_text"
+    GENERATING_TRANSITIONS = "generating_transitions"
+    GENERATING_SOUND = "generating_sound"
+    RENDERING = "rendering"
+    QUALITY_CHECK = "quality_check"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class ProvenanceType(StrEnum):
+    """How a piece of externally-obtained information was sourced."""
+
+    GEOCODING = "geocoding"
+    ASSET = "asset"
+    AI_GENERATED = "ai_generated"
+    MANUAL = "manual"
+    OTHER = "other"

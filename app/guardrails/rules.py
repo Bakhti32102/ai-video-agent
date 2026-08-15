@@ -220,23 +220,158 @@ def check_agent_output(model_cls: type[BaseModel], payload: Any) -> Result[BaseM
     """Validate an agent's raw output against a Pydantic model class."""
     try:
         instance = model_cls.model_validate(payload)
-    except ValidationError as exc:  # pragma: no cover - exercised in tests
+    except ValidationError as exc:
         return Result.fail("agent output failed schema validation", *[str(e) for e in exc.errors()])
     return Result.ok(instance)
 
 
+# --- path traversal ---------------------------------------------------------
+
+
+def check_path_traversal(path: str) -> Result[str]:
+    """Reject paths that contain traversal sequences (``..``) or control chars."""
+    from app.utils.paths import contains_traversal, is_path_safe
+
+    if not path or not str(path).strip():
+        return Result.fail("path must not be empty")
+    if contains_traversal(path):
+        return Result.fail(f"path traversal detected: {path}")
+    if not is_path_safe(path, allow_absolute=True):
+        return Result.fail(f"unsafe path rejected: {path}")
+    return Result.ok(path)
+
+
+def check_file_path_safe(path: str, *, base_dir: str | None = None, must_exist: bool = False) -> Result[str]:
+    """Full file-path safety check: traversal + extension + containment.
+
+    Combines :func:`check_file_path`, :func:`check_path_traversal`, and an
+    optional containment check against ``base_dir``.
+    """
+    r = check_file_path(path, must_exist=False)
+    if r.is_failure:
+        return r
+    r = check_path_traversal(path)
+    if r.is_failure:
+        return r
+    if base_dir is not None:
+        from app.utils.paths import restrict_to_directory
+        from app.core.exceptions import FileSafetyError
+
+        try:
+            restrict_to_directory(path, base_dir, must_exist=must_exist)
+        except FileSafetyError as exc:
+            return Result.fail(str(exc))
+    elif must_exist:
+        r = check_file_path(path, must_exist=True)
+        if r.is_failure:
+            return r
+    return Result.ok(path)
+
+
+# --- invalid IDs ------------------------------------------------------------
+
+import re as _re
+
+_ID_PATTERN = _re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+
+def check_id(value: str | None, *, field: str = "id") -> Result[str]:
+    """Validate that an ID matches the contract pattern and is non-empty."""
+    if value is None or not str(value).strip():
+        return Result.fail(f"{field} must not be empty")
+    v = str(value).strip()
+    if not _ID_PATTERN.match(v):
+        return Result.fail(
+            f"{field} '{v}' is invalid; must match ^[A-Za-z0-9_\\-]{{1,64}}$"
+        )
+    return Result.ok(v)
+
+
+# --- workflow state transitions ---------------------------------------------
+
+
+def check_workflow_transition(current: str, target: str) -> Result[str]:
+    """Validate a workflow state transition using the state machine."""
+    from app.core.enums import WorkflowState
+    from app.core.workflow import can_transition_to
+
+    try:
+        cur = WorkflowState(current)
+    except ValueError:
+        return Result.fail(f"unknown current workflow state: '{current}'")
+    try:
+        tgt = WorkflowState(target)
+    except ValueError:
+        return Result.fail(f"unknown target workflow state: '{target}'")
+    result = can_transition_to(cur, tgt)
+    if result.is_failure:
+        return Result.fail(*result.errors)
+    return Result.ok(target)
+
+
+# --- agent status -----------------------------------------------------------
+
+
+def check_agent_status(status: str) -> Result[str]:
+    """Validate that an agent status is a known AgentRunStatus value."""
+    from app.core.enums import AgentRunStatus
+
+    valid = {s.value for s in AgentRunStatus}
+    if status not in valid:
+        return Result.fail(
+            f"invalid agent status '{status}'; must be one of {sorted(valid)}"
+        )
+    return Result.ok(status)
+
+
+# --- provenance -------------------------------------------------------------
+
+
+def check_provenance(provenance: Any) -> Result[Any]:
+    """Validate that externally-obtained data carries traceable provenance.
+
+    Provenance is required for any data that did not originate inside the
+    pipeline. The source/provider must be non-empty and must not be a
+    placeholder like 'unknown' or 'none'.
+    """
+    if provenance is None:
+        return Result.fail("provenance is required for externally-obtained data; refusing untraceable data")
+    if isinstance(provenance, dict):
+        provider = str(provenance.get("provider", "")).strip().lower()
+        source = str(provenance.get("source", "")).strip().lower()
+        if not provider or provider in {"unknown", "none"}:
+            return Result.fail("provenance provider must be traceable; 'unknown'/'none' rejected")
+        if not source or source in {"unknown", "none"}:
+            return Result.fail("provenance source must be traceable; 'unknown'/'none' rejected")
+        return Result.ok(provenance)
+    # If it's a Pydantic model with provider/source attributes.
+    provider = str(getattr(provenance, "provider", "")).strip().lower()
+    source = str(getattr(provenance, "source", "")).strip().lower()
+    if not provider or provider in {"unknown", "none"}:
+        return Result.fail("provenance provider must be traceable; 'unknown'/'none' rejected")
+    if not source or source in {"unknown", "none"}:
+        return Result.fail("provenance source must be traceable; 'unknown'/'none' rejected")
+    return Result.ok(provenance)
+
+
 __all__ = [
     "check_agent_output",
+    "check_agent_status",
     "check_api_configuration",
     "check_asset",
     "check_coordinates",
     "check_duration",
     "check_file_path",
+    "check_file_path_safe",
+    "check_id",
     "check_location",
     "check_missing_assets",
+    "check_path_traversal",
+    "check_provenance",
     "check_required_fields",
     "check_scene_timing",
     "check_supported_media",
     "check_time_range",
     "check_timeline_overlaps",
+    "check_workflow_transition",
 ]
