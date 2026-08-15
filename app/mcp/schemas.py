@@ -199,6 +199,21 @@ class BuildMapPlanOutput(ToolOutput):
     warnings: list[str] = Field(default_factory=list)
 
 
+class RenderMapInput(ToolInput):
+    plan: dict[str, Any] = Field(description="MapAnimationPlan dict from build_map_plan")
+    output_filename: str = Field(
+        min_length=1, max_length=255,
+        description="Output PNG filename (relative to the output directory)",
+    )
+
+
+class RenderMapOutput(ToolOutput):
+    output_path: str
+    width: int = 1920
+    height: int = 1080
+    warnings: list[str] = Field(default_factory=list)
+
+
 # === Assets MCP ===
 
 

@@ -33,6 +33,8 @@ from app.mcp.schemas import (
     BuildMapPlanOutput,
     GeocodeLocationInput,
     GeocodeLocationOutput,
+    RenderMapInput,
+    RenderMapOutput,
     ReverseGeocodeInput,
     ReverseGeocodeOutput,
     ValidateCoordinatesInput,
@@ -41,7 +43,7 @@ from app.mcp.schemas import (
 from app.mcp.servers.base import BaseMcpServer, ToolDefinition
 from app.schemas.contracts import Location
 from app.services.geo import GeoProvider, GeocodeResult, get_geo_provider
-from app.services.map_engine import MapAnimationEngine
+from app.services.map_engine import MapAnimationEngine, MapAnimationPlan, MapRenderer
 
 
 class GeoMcpServer(BaseMcpServer):
@@ -55,6 +57,7 @@ class GeoMcpServer(BaseMcpServer):
         super().__init__()
         self.provider = provider or get_geo_provider()
         self.map_engine = MapAnimationEngine()
+        self.map_renderer = MapRenderer()
         self._register_tool(ToolDefinition(
             name="geocode_location",
             description="Resolve a place name to verified coordinates with full provenance.",
@@ -94,6 +97,14 @@ class GeoMcpServer(BaseMcpServer):
             output_schema=BuildMapPlanOutput,
             handler=self._build_map_plan,
             tags={"read"},
+        ))
+        self._register_tool(ToolDefinition(
+            name="render_map",
+            description="Render a MapAnimationPlan (from build_map_plan) to a PNG file via MapRenderer.",
+            input_schema=RenderMapInput,
+            output_schema=RenderMapOutput,
+            handler=self._render_map,
+            tags={"write"},
         ))
 
     async def handle(self, tool: str, arguments: dict[str, Any]) -> Result[Any]:
@@ -188,6 +199,35 @@ class GeoMcpServer(BaseMcpServer):
             return Result.fail(str(exc))
         warnings.append("map plan is structured; tile rendering via optional adapter")
         return Result.ok(BuildMapPlanOutput(plan=plan.to_dict(), warnings=warnings))
+
+    async def _render_map(self, inp: RenderMapInput) -> Result[RenderMapOutput]:
+        """Render a MapAnimationPlan dict to a PNG file via MapRenderer.
+
+        Reconstructs the plan from its dict form (produced by build_map_plan)
+        and calls ``MapRenderer.render_to_png``. The output filename is
+        restricted to the configured output directory to prevent traversal.
+        """
+        from app.utils.paths import contains_traversal
+
+        warnings: list[str] = list(inp.plan.get("_warnings", []))
+        output_filename = inp.output_filename
+        if contains_traversal(output_filename) or "\x00" in output_filename:
+            return Result.fail(f"unsafe output filename: {output_filename}")
+        try:
+            plan = MapAnimationPlan.from_dict(inp.plan)
+        except Exception as exc:  # noqa: BLE001
+            return Result.fail(f"invalid map plan: {exc}")
+        try:
+            output_path = self.map_renderer.render_to_png(plan, output_filename)
+        except Exception as exc:  # noqa: BLE001
+            return Result.fail(f"map rendering failed: {exc}")
+        warnings.append("map rendered to stylized PNG (no real map tiles)")
+        return Result.ok(RenderMapOutput(
+            output_path=output_path,
+            width=plan.output_width,
+            height=plan.output_height,
+            warnings=warnings,
+        ))
 
     @staticmethod
     def _dict_to_location(d: dict[str, Any]) -> Location:

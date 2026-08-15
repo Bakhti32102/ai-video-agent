@@ -33,6 +33,7 @@ from app.config import Settings, get_settings
 from app.core.logging import get_logger
 from app.schemas.contracts import GeoProvenance, Location
 from app.utils.ids import new_id
+from app.utils.paths import restrict_to_directory
 
 logger = get_logger("map_engine")
 
@@ -127,6 +128,66 @@ class MapAnimationPlan:
         if self.provenance is not None:
             d["provenance"] = self.provenance.model_dump(mode="json")
         return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "MapAnimationPlan":
+        """Reconstruct a MapAnimationPlan from its dict form (e.g. from build_map_plan output).
+
+        This is used by the render_map tool to render a plan that was serialized
+        through the MCP boundary. Provenance is reconstructed if present.
+        Raises ValueError if the dict is not a recognizable map plan.
+        """
+        if not isinstance(d, dict) or not d:
+            raise ValueError("plan dict is empty or not a dict")
+        # A valid plan must have at least a center coordinate or markers.
+        has_center = "center_latitude" in d and "center_longitude" in d
+        has_markers = bool(d.get("markers"))
+        if not has_center and not has_markers:
+            raise ValueError("plan dict has no center coordinates or markers")
+        markers = [
+            MapMarker(
+                latitude=m.get("latitude", 0.0),
+                longitude=m.get("longitude", 0.0),
+                label=m.get("label"),
+                color=m.get("color", "#E63946"),
+                size=m.get("size", 12),
+            )
+            for m in d.get("markers", [])
+        ]
+        provenance = None
+        prov_data = d.get("provenance")
+        if isinstance(prov_data, dict):
+            try:
+                provenance = GeoProvenance.model_validate(prov_data)
+            except Exception:
+                provenance = None
+        return cls(
+            id=d.get("id", new_id("map_")),
+            scene_id=d.get("scene_id", ""),
+            location_id=d.get("location_id", ""),
+            animation_type=d.get("animation_type", "static"),
+            style=d.get("style", "default"),
+            center_latitude=d.get("center_latitude", 0.0),
+            center_longitude=d.get("center_longitude", 0.0),
+            zoom_start=d.get("zoom_start", 4.0),
+            zoom_end=d.get("zoom_end", 4.0),
+            bearing_start=d.get("bearing_start", 0.0),
+            bearing_end=d.get("bearing_end", 0.0),
+            start_latitude=d.get("start_latitude"),
+            start_longitude=d.get("start_longitude"),
+            end_latitude=d.get("end_latitude"),
+            end_longitude=d.get("end_longitude"),
+            route=d.get("route", []),
+            markers=markers,
+            labels=d.get("labels", []),
+            duration_sec=d.get("duration_sec", 5.0),
+            easing=d.get("easing", "ease_in_out"),
+            aspect_ratio=d.get("aspect_ratio", "16:9"),
+            output_width=d.get("output_width", 1920),
+            output_height=d.get("output_height", 1080),
+            source=d.get("source", "verified"),
+            provenance=provenance,
+        )
 
 
 class MapAnimationEngine:
@@ -312,6 +373,18 @@ class MapRenderer:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
 
+    def _validate_output_path(self, path: str) -> Path:
+        """Output must be inside the approved output or temp directory."""
+        from app.core.exceptions import FileSafetyError
+
+        for root_attr in ("output_path", "temp_path"):
+            root = getattr(self.settings, root_attr)
+            try:
+                return restrict_to_directory(path, root)
+            except FileSafetyError:
+                continue
+        raise FileSafetyError(f"output path not in approved directory: {path}")
+
     def render_to_svg(self, plan: MapAnimationPlan, output_path: str) -> str:
         """Render a plan to an SVG file. Returns the output path."""
         w, h = plan.output_width, plan.output_height
@@ -375,13 +448,21 @@ class MapRenderer:
         return output_path
 
     def render_to_png(self, plan: MapAnimationPlan, output_path: str) -> str:
-        """Render a plan to a PNG file using Pillow. Returns the output path."""
+        """Render a plan to a PNG file using Pillow. Returns the output path.
+
+        The output path is restricted to the configured output or temp
+        directory to prevent writing outside approved locations. A relative
+        filename is resolved against the output directory.
+        """
         try:
             from PIL import Image, ImageDraw, ImageFont
         except ImportError as exc:
             raise RuntimeError(
                 "Pillow is required for PNG map rendering; install with 'pip install Pillow'"
             ) from exc
+
+        # Restrict output to the approved output/temp directory.
+        resolved = self._validate_output_path(output_path)
 
         w, h = plan.output_width, plan.output_height
         img = Image.new("RGB", (w, h), self._hex(self.BG_COLOR))
@@ -432,10 +513,10 @@ class MapRenderer:
         if plan.provenance:
             prov_text = f"Source: {plan.provenance.provider} | {plan.provenance.source}"
             draw.text((40, h - 40), prov_text, fill=text_color, font=font_small)
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        img.save(output_path, "PNG")
-        logger.info("rendered PNG map plan to %s", output_path)
-        return output_path
+        Path(resolved).parent.mkdir(parents=True, exist_ok=True)
+        img.save(resolved, "PNG")
+        logger.info("rendered PNG map plan to %s", resolved)
+        return str(resolved)
 
     # --- helpers ------------------------------------------------------------
 
