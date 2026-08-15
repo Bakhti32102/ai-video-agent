@@ -26,6 +26,8 @@ from typing import Any
 from app.core.enums import AgentName
 from app.core.result import Result
 from app.mcp.schemas import (
+    BuildAudioMixInput,
+    BuildAudioMixOutput,
     CreateSoundDesignPlanInput,
     CreateSoundDesignPlanOutput,
     CreateSoundEventInput,
@@ -44,11 +46,11 @@ VALID_KINDS = {
 
 
 class SoundMcpServer(BaseMcpServer):
-    """Manages SFX, ambience and background music."""
+    """Manages SFX, ambience and background music, with audio mixing."""
 
     name = AgentName.SOUND
-    version = "3.0.0"
-    description = "Creates structured sound-design plans; never references nonexistent assets."
+    version = "4.0.0"
+    description = "Creates structured sound-design plans and FFmpeg audio mix filtergraphs."
 
     def __init__(self) -> None:
         super().__init__()
@@ -76,6 +78,14 @@ class SoundMcpServer(BaseMcpServer):
             input_schema=ValidateSoundEventInput,
             output_schema=ValidateSoundEventOutput,
             handler=self._validate_sound_event,
+            tags={"read"},
+        ))
+        self._register_tool(ToolDefinition(
+            name="build_audio_mix",
+            description="Generate an FFmpeg filtergraph to mix voiceover + SFX + music into one audio track.",
+            input_schema=BuildAudioMixInput,
+            output_schema=BuildAudioMixOutput,
+            handler=self._build_audio_mix,
             tags={"read"},
         ))
 
@@ -155,6 +165,61 @@ class SoundMcpServer(BaseMcpServer):
         return Result.ok(ValidateSoundEventOutput(
             valid=not errors,
             errors=errors,
+            warnings=warnings,
+        ))
+
+    async def _build_audio_mix(self, inp: BuildAudioMixInput) -> Result[BuildAudioMixOutput]:
+        """Generate an FFmpeg filtergraph for mixing voiceover + SFX + music.
+
+        Uses the ``amix`` filter to combine all audio inputs into one track,
+        with per-input volume adjustment via ``volume`` filter (in dB).
+
+        The resulting filtergraph is designed for ``-filter_complex``. The
+        caller supplies the actual ``-i`` input arguments in the same order:
+        [0] voiceover, [1..N] SFX, [N+1] music (if present).
+        """
+        warnings: list[str] = []
+        parts: list[str] = []
+        input_idx = 0
+        # Voiceover: apply volume adjustment.
+        if inp.voiceover_volume_db != 0.0:
+            parts.append(f"[{input_idx}:a]volume={inp.voiceover_volume_db}dB[v{input_idx}]")
+            vo_label = f"[v{input_idx}]"
+        else:
+            vo_label = f"[{input_idx}:a]"
+        input_idx += 1
+        mix_labels: list[str] = [vo_label]
+
+        # SFX tracks.
+        if inp.sfx_paths:
+            for _ in inp.sfx_paths:
+                if inp.sfx_volume_db != 0.0:
+                    parts.append(f"[{input_idx}:a]volume={inp.sfx_volume_db}dB[v{input_idx}]")
+                    mix_labels.append(f"[v{input_idx}]")
+                else:
+                    mix_labels.append(f"[{input_idx}:a]")
+                input_idx += 1
+
+        # Music track.
+        if inp.music_path:
+            if inp.music_volume_db != 0.0:
+                parts.append(f"[{input_idx}:a]volume={inp.music_volume_db}dB[v{input_idx}]")
+                mix_labels.append(f"[v{input_idx}]")
+            else:
+                mix_labels.append(f"[{input_idx}:a]")
+            input_idx += 1
+
+        # amix to combine all.
+        mix_inputs = "".join(mix_labels)
+        parts.append(f"{mix_inputs}amix=inputs={len(mix_labels)}:duration=longest:dropout_transition=0[aout]")
+
+        filtergraph = ";".join(parts)
+        warnings.append(f"filtergraph expects {input_idx} input files; supply -i args in order")
+        warnings.append("test filtergraph with actual ffmpeg binary before final render")
+        return Result.ok(BuildAudioMixOutput(
+            filtergraph=filtergraph,
+            output_path=inp.output_path,
+            input_count=input_idx,
             warnings=warnings,
         ))
 

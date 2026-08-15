@@ -29,6 +29,8 @@ from app.core.result import Result
 from app.mcp.schemas import (
     BatchGeocodeInput,
     BatchGeocodeOutput,
+    BuildMapPlanInput,
+    BuildMapPlanOutput,
     GeocodeLocationInput,
     GeocodeLocationOutput,
     ReverseGeocodeInput,
@@ -37,7 +39,9 @@ from app.mcp.schemas import (
     ValidateCoordinatesOutput,
 )
 from app.mcp.servers.base import BaseMcpServer, ToolDefinition
+from app.schemas.contracts import Location
 from app.services.geo import GeoProvider, GeocodeResult, get_geo_provider
+from app.services.map_engine import MapAnimationEngine
 
 
 class GeoMcpServer(BaseMcpServer):
@@ -50,6 +54,7 @@ class GeoMcpServer(BaseMcpServer):
     def __init__(self, provider: GeoProvider | None = None) -> None:
         super().__init__()
         self.provider = provider or get_geo_provider()
+        self.map_engine = MapAnimationEngine()
         self._register_tool(ToolDefinition(
             name="geocode_location",
             description="Resolve a place name to verified coordinates with full provenance.",
@@ -80,6 +85,14 @@ class GeoMcpServer(BaseMcpServer):
             input_schema=ReverseGeocodeInput,
             output_schema=ReverseGeocodeOutput,
             handler=self._reverse_geocode,
+            tags={"read"},
+        ))
+        self._register_tool(ToolDefinition(
+            name="build_map_plan",
+            description="Build a provider-independent MapAnimationPlan from a verified location.",
+            input_schema=BuildMapPlanInput,
+            output_schema=BuildMapPlanOutput,
+            handler=self._build_map_plan,
             tags={"read"},
         ))
 
@@ -133,6 +146,62 @@ class GeoMcpServer(BaseMcpServer):
             provider=result.provider,
             error=result.error,
         ))
+
+    async def _build_map_plan(self, inp: BuildMapPlanInput) -> Result[BuildMapPlanOutput]:
+        """Build a MapAnimationPlan from a verified location dict."""
+        try:
+            loc = self._dict_to_location(inp.location)
+        except Exception as exc:
+            return Result.fail(f"invalid location: {exc}")
+        warnings: list[str] = []
+        atype = inp.animation_type
+        try:
+            if atype == "static":
+                plan = self.map_engine.build_static_plan(
+                    loc, scene_id=inp.scene_id, duration_sec=inp.duration_sec,
+                    zoom=inp.zoom_start, style=inp.style,
+                )
+            elif atype == "zoom":
+                plan = self.map_engine.build_zoom_plan(
+                    loc, scene_id=inp.scene_id, duration_sec=inp.duration_sec,
+                    zoom_start=inp.zoom_start, zoom_end=inp.zoom_end, style=inp.style,
+                )
+            elif atype == "pan":
+                if not inp.end_location:
+                    return Result.fail("pan animation requires end_location")
+                end_loc = self._dict_to_location(inp.end_location)
+                plan = self.map_engine.build_pan_plan(
+                    loc, end_loc, scene_id=inp.scene_id, duration_sec=inp.duration_sec,
+                    zoom=inp.zoom_start, style=inp.style,
+                )
+            elif atype == "route":
+                if not inp.route_locations or len(inp.route_locations) < 2:
+                    return Result.fail("route animation requires route_locations (>=2)")
+                locs = [self._dict_to_location(d) for d in inp.route_locations]
+                plan = self.map_engine.build_route_plan(
+                    locs, scene_id=inp.scene_id, duration_sec=inp.duration_sec,
+                    zoom=inp.zoom_start, style=inp.style,
+                )
+            else:
+                return Result.fail(f"unsupported animation_type: {atype}")
+        except ValueError as exc:
+            return Result.fail(str(exc))
+        warnings.append("map plan is structured; tile rendering via optional adapter")
+        return Result.ok(BuildMapPlanOutput(plan=plan.to_dict(), warnings=warnings))
+
+    @staticmethod
+    def _dict_to_location(d: dict[str, Any]) -> Location:
+        """Convert a dict to a validated Location (requires provenance)."""
+        return Location(
+            id=d.get("id", "loc"),
+            name=d.get("name", "unknown"),
+            country=d.get("country"),
+            latitude=float(d["latitude"]),
+            longitude=float(d["longitude"]),
+            source=d.get("source", "unknown"),
+            date=d.get("date"),
+            provenance=d.get("provenance"),
+        )
 
     # --- legacy: build_map_animation ----------------------------------------
 

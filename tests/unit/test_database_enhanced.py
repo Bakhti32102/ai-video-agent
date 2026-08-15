@@ -211,3 +211,69 @@ class TestIndexCoverage:
             session.flush()
             results = session.query(Asset).filter_by(asset_type="video").all()
             assert len(results) == 1
+
+
+
+class TestProjectServicePhase4:
+    """Tests for Phase 4 DB persistence methods in ProjectService."""
+
+    def test_save_render_job(self, fresh_db) -> None:
+        from app.services.projects import ProjectService
+        svc = ProjectService()
+        pid = svc.create_project(name="Test")
+        job_id = svc.save_render_job(
+            pid,
+            output_path="output/test.mp4",
+            status="completed",
+            duration_sec=10.0,
+            width=1920,
+            height=1080,
+        )
+        assert job_id.startswith("render_")
+        jobs = svc.get_render_jobs(pid)
+        assert len(jobs) == 1
+        assert jobs[0].output_path == "output/test.mp4"
+        assert jobs[0].status == "completed"
+
+    def test_save_qa_report(self, fresh_db) -> None:
+        from app.services.projects import ProjectService
+        svc = ProjectService()
+        pid = svc.create_project(name="Test")
+        report_id = svc.save_qa_report(
+            pid,
+            passed=True,
+            findings=[{"category": "x", "severity": "warning", "message": "ok"}],
+            summary="1 finding; passed=True",
+        )
+        assert report_id.startswith("qa_")
+        reports = svc.get_qa_reports(pid)
+        assert len(reports) == 1
+        assert reports[0].passed is True
+
+    def test_save_workflow_state_upsert(self, fresh_db) -> None:
+        from app.services.projects import ProjectService
+        svc = ProjectService()
+        pid = svc.create_project(name="Test")
+        state_id1 = svc.save_workflow_state(pid, current_state="created", current_phase="init")
+        state_id2 = svc.save_workflow_state(pid, current_state="completed", current_phase="done")
+        # Upsert: same ID, updated state.
+        assert state_id1 == state_id2
+        from app.models import WorkflowState as WorkflowStateModel
+        from app.database.session import session_scope
+        with session_scope() as session:
+            ws = session.get(WorkflowStateModel, state_id1)
+            assert ws.current_state == "completed"
+            assert ws.current_phase == "done"
+
+    def test_get_render_jobs_empty(self, fresh_db) -> None:
+        from app.services.projects import ProjectService
+        svc = ProjectService()
+        pid = svc.create_project(name="Test")
+        assert svc.get_render_jobs(pid) == []
+
+    def test_create_project_with_explicit_id(self, fresh_db) -> None:
+        from app.services.projects import ProjectService
+        svc = ProjectService()
+        svc.create_project(name="Test", project_id="custom_id_123")
+        assert svc.get_project("custom_id_123") is not None
+

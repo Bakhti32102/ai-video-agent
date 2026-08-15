@@ -143,18 +143,32 @@ class ScriptMcpServer(BaseMcpServer):
         scenes: list[dict[str, Any]] = []
         for i, para in enumerate(paragraphs):
             start = i * per
-            scenes.append({
+            end = round(start + per, 3)
+            # Extract per-scene requirements.
+            entities = self._entities_for_paragraph(para)
+            locations = self._locations_for_paragraph(para)
+            scene = {
                 "id": new_id("scene_"),
                 "project_id": project_id,
                 "index": i,
                 "title": self._derive_title(para, i),
                 "narration": para,
                 "start_time": round(start, 3),
-                "end_time": round(start + per, 3),
-            })
+                "end_time": end,
+                "duration": round(per, 3),
+                "entities": entities,
+                "locations": locations,
+                "visual_type": self._visual_type(para, locations),
+                "map_required": bool(locations),
+                "text_required": True,
+                "icon_required": self._icon_required(para),
+                "transition_type": self._transition_type(i, n),
+                "sound_design_requirements": self._sound_reqs(para),
+            }
+            scenes.append(scene)
         return Result.ok(SplitIntoScenesOutput(
             scenes=scenes,
-            warnings=["script splitting is heuristic; paragraph-based"],
+            warnings=["script splitting is heuristic; paragraph-based with proportional timing"],
         ))
 
     async def _extract_entities(self, inp: ExtractEntitiesInput) -> Result[ExtractEntitiesOutput]:
@@ -223,6 +237,67 @@ class ScriptMcpServer(BaseMcpServer):
         if "square miles" in text_lower or "acres" in text_lower:
             objects.append("land_area")
         return sorted(set(objects))
+
+    # --- per-scene requirement helpers -------------------------------------
+
+    def _entities_for_paragraph(self, paragraph: str) -> dict[str, Any]:
+        """Extract entities scoped to a single paragraph (provenance-preserved)."""
+        lower = paragraph.lower()
+        dates = sorted(set(m.group(0) for m in _DATE_RE.finditer(paragraph)))
+        people = sorted({p for p in _KNOWN_PEOPLE if p in lower})
+        events = self._detect_events(lower)
+        objects = self._detect_objects(lower)
+        return {
+            "dates": dates,
+            "people": people,
+            "events": events,
+            "objects": objects,
+        }
+
+    def _locations_for_paragraph(self, paragraph: str) -> list[dict[str, Any]]:
+        """Extract location mentions from one paragraph (marked unresolved)."""
+        lower = paragraph.lower()
+        found = sorted({kw for kw in _PLACE_KEYWORDS if kw in lower})
+        return [{"name": name, "status": "unresolved", "confidence": 0.0} for name in found]
+
+    @staticmethod
+    def _visual_type(paragraph: str, locations: list[dict]) -> str:
+        """Determine the visual type for a scene."""
+        if locations:
+            return "map"
+        lower = paragraph.lower()
+        if any(kw in lower for kw in ("portrait", "photograph", "photo")):
+            return "image"
+        if any(kw in lower for kw in ("chart", "graph", "statistics", "percent")):
+            return "graphic"
+        return "text"
+
+    @staticmethod
+    def _icon_required(paragraph: str) -> bool:
+        lower = paragraph.lower()
+        return any(kw in lower for kw in ("million", "dollars", "currency", "money", "percent", "%"))
+
+    @staticmethod
+    def _transition_type(index: int, total: int) -> str:
+        """Default transition between scenes."""
+        if index == 0:
+            return "fade"
+        if index == total - 1:
+            return "fade"
+        return "dissolve"
+
+    @staticmethod
+    def _sound_reqs(paragraph: str) -> list[dict[str, Any]]:
+        """Derive sound design requirements for a scene from its narration."""
+        lower = paragraph.lower()
+        reqs: list[dict[str, Any]] = []
+        if any(kw in lower for kw in ("negotiated", "agreement", "treaty", "signed")):
+            reqs.append({"cue": "historical_atmosphere", "reason": "historical/diplomatic event"})
+        if any(kw in lower for kw in ("war", "battle", "invasion", "attack")):
+            reqs.append({"cue": "impact", "reason": "conflict reference"})
+        if any(kw in lower for kw in ("travel", "journey", "crossed", "expansion")):
+            reqs.append({"cue": "whoosh", "reason": "movement reference"})
+        return reqs
 
     def _extract_requirements(self, text: str, scenes: list[dict]) -> dict[str, Any]:
         """Derive visual/map/icon/text/transition/sound requirements from script."""

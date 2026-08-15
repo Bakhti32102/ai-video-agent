@@ -83,6 +83,13 @@ class ExtractLocationsOutput(ToolOutput):
 # === Audio MCP ===
 
 
+class SilenceSegment(ToolOutput):
+    start_time: float = Field(ge=0.0)
+    end_time: float = Field(ge=0.0)
+    duration_sec: float = Field(ge=0.0)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
 class InspectAudioInput(ToolInput):
     file_path: str = Field(min_length=1)
     duration_sec: float | None = Field(default=None, gt=0.0)
@@ -174,6 +181,24 @@ class ReverseGeocodeOutput(ToolOutput):
     error: str | None = None
 
 
+class BuildMapPlanInput(ToolInput):
+    location: dict[str, Any] = Field(description="Verified location with latitude, longitude, source, name")
+    animation_type: str = Field(default="static", description="static|zoom|pan|route")
+    scene_id: str = Field(default="", pattern=r"^[A-Za-z0-9_\-]{0,64}$")
+    duration_sec: float = Field(default=5.0, gt=0.0, le=120.0)
+    zoom_start: float = Field(default=5.0, ge=0.0, le=22.0)
+    zoom_end: float = Field(default=5.0, ge=0.0, le=22.0)
+    # For pan/route: second location or route points.
+    end_location: dict[str, Any] | None = None
+    route_locations: list[dict[str, Any]] | None = None
+    style: str = Field(default="default")
+
+
+class BuildMapPlanOutput(ToolOutput):
+    plan: dict[str, Any]
+    warnings: list[str] = Field(default_factory=list)
+
+
 # === Assets MCP ===
 
 
@@ -184,6 +209,8 @@ class RegisterAssetInput(ToolInput):
     file_path: str = Field(min_length=1, max_length=512)
     source: str = Field(min_length=1, max_length=128)
     license: str | None = None
+    tags: list[str] | None = None
+    dimensions: dict[str, int] | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -231,11 +258,24 @@ class ValidateAssetOutput(ToolOutput):
 class FindAssetInput(ToolInput):
     query: str = Field(min_length=1, max_length=255)
     asset_type: AssetType | None = None
+    tags: list[str] | None = None
 
 
 class FindAssetOutput(ToolOutput):
     assets: list[dict[str, Any]] = Field(default_factory=list)
     count: int = 0
+
+
+class ScanAssetsDirInput(ToolInput):
+    directory: str | None = Field(default=None, description="Directory to scan; defaults to ASSETS_DIR")
+    recursive: bool = Field(default=True)
+
+
+class ScanAssetsDirOutput(ToolOutput):
+    scanned: int = 0
+    registered: int = 0
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 # === Text MCP ===
@@ -260,6 +300,27 @@ class CreateTextOverlayOutput(ToolOutput):
     warnings: list[str] = Field(default_factory=list)
 
 
+class RenderTextInput(ToolInput):
+    text: str = Field(min_length=1, max_length=500)
+    output_path: str = Field(min_length=1, max_length=512)
+    font_size: int = Field(default=48, ge=8, le=200)
+    color: str = Field(default="#FFFFFF", pattern=r"^#?[0-9A-Fa-f]{6}$")
+    background_color: str = Field(default="#000000", pattern=r"^#?[0-9A-Fa-f]{6}$")
+    width: int = Field(default=1920, ge=1, le=7680)
+    height: int = Field(default=1080, ge=1, le=4320)
+    x: float = Field(default=0.1, ge=0.0, le=1.0)
+    y: float = Field(default=0.1, ge=0.0, le=1.0)
+    font_path: str | None = None
+    align: str = Field(default="left", description="left|center|right")
+
+
+class RenderTextOutput(ToolOutput):
+    output_path: str
+    width: int
+    height: int
+    warnings: list[str] = Field(default_factory=list)
+
+
 # === Transitions MCP ===
 
 
@@ -273,6 +334,21 @@ class CreateTransitionInput(ToolInput):
 
 class CreateTransitionOutput(ToolOutput):
     transition: dict[str, Any]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BuildFiltergraphInput(ToolInput):
+    transition_kind: str = Field(description="cut|fade|dissolve|slide|wipe|zoom")
+    duration_sec: float = Field(default=1.0, gt=0.0, le=5.0)
+    offset_sec: float = Field(default=0.0, ge=0.0, description="Offset from start of clip")
+    total_duration_sec: float = Field(default=10.0, gt=0.0)
+    direction: str = Field(default="left", description="slide/wipe direction: left|right|up|down")
+    fade_color: str = Field(default="black", description="Color for fade (e.g. black, white)")
+
+
+class BuildFiltergraphOutput(ToolOutput):
+    filtergraph: str
+    filter_description: str = ""
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -302,6 +378,23 @@ class CreateSoundDesignPlanInput(ToolInput):
 
 class CreateSoundDesignPlanOutput(ToolOutput):
     events: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BuildAudioMixInput(ToolInput):
+    voiceover_path: str = Field(min_length=1, description="Path to voice-over audio file")
+    sfx_paths: list[str] | None = None
+    music_path: str | None = None
+    voiceover_volume_db: float = Field(default=0.0, ge=-60.0, le=12.0)
+    sfx_volume_db: float = Field(default=-6.0, ge=-60.0, le=12.0)
+    music_volume_db: float = Field(default=-18.0, ge=-60.0, le=12.0)
+    output_path: str = Field(min_length=1)
+
+
+class BuildAudioMixOutput(ToolOutput):
+    filtergraph: str
+    output_path: str
+    input_count: int
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -374,6 +467,29 @@ class GetRenderStatusOutput(ToolOutput):
     status: str
     output_path: str | None = None
     error: str | None = None
+
+
+class ComposeVideoInput(ToolInput):
+    output_filename: str = Field(min_length=1, max_length=255)
+    project_id: str = Field(default="proj", pattern=r"^[A-Za-z0-9_\-]{1,64}$")
+    width: int = Field(default=1920, ge=1, le=7680)
+    height: int = Field(default=1080, ge=1, le=4320)
+    fps: float = Field(default=30.0, gt=0.0, le=120.0)
+    duration_sec: float = Field(default=10.0, gt=0.0, le=600.0)
+    background_color: str = Field(default="#1a1a2e", pattern=r"^#?[0-9A-Fa-f]{6}$")
+    background_image: str | None = None
+    overlays: list[dict[str, Any]] | None = None
+    audio_path: str | None = None
+    video_filter: str | None = None
+    format: str = Field(default="mp4")
+
+
+class ComposeVideoOutput(ToolOutput):
+    job_id: str
+    status: str
+    output_path: str
+    duration_sec: float
+    warnings: list[str] = Field(default_factory=list)
 
 
 # === QA MCP ===

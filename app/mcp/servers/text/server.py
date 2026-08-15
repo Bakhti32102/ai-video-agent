@@ -21,8 +21,14 @@ from typing import Any
 
 from app.core.enums import AgentName
 from app.core.result import Result
-from app.mcp.schemas import CreateTextOverlayInput, CreateTextOverlayOutput
+from app.mcp.schemas import (
+    CreateTextOverlayInput,
+    CreateTextOverlayOutput,
+    RenderTextInput,
+    RenderTextOutput,
+)
 from app.mcp.servers.base import BaseMcpServer, ToolDefinition
+from app.services.text_renderer import TextRenderer
 from app.utils.ids import new_id
 
 # Title-safe area (normalized): keep content within these margins.
@@ -39,20 +45,29 @@ VALID_ANIMATIONS = {"none", "fade_in", "fade_out", "slide_up", "slide_left", "ty
 
 
 class TextMcpServer(BaseMcpServer):
-    """Generates text overlays with safe positioning."""
+    """Generates text overlays with safe positioning and renders them to PNG."""
 
     name = AgentName.TEXT
-    version = "3.0.0"
-    description = "Creates structured text overlay specifications (no rendering)."
+    version = "4.0.0"
+    description = "Creates and renders text overlays (title, subtitle, lower third, labels)."
 
-    def __init__(self) -> None:
+    def __init__(self, renderer: TextRenderer | None = None) -> None:
         super().__init__()
+        self.renderer = renderer or TextRenderer()
         self._register_tool(ToolDefinition(
             name="create_text_overlay",
             description="Create a structured text overlay spec with safe positioning and animation.",
             input_schema=CreateTextOverlayInput,
             output_schema=CreateTextOverlayOutput,
             handler=self._create_text_overlay,
+            tags={"write"},
+        ))
+        self._register_tool(ToolDefinition(
+            name="render_text",
+            description="Render text to a PNG image file using Pillow (open-source, no After Effects).",
+            input_schema=RenderTextInput,
+            output_schema=RenderTextOutput,
+            handler=self._render_text,
             tags={"write"},
         ))
 
@@ -96,6 +111,37 @@ class TextMcpServer(BaseMcpServer):
         return Result.ok(CreateTextOverlayOutput(
             overlay=overlay,
             safe_zone=not warnings,
+            warnings=warnings,
+        ))
+
+    async def _render_text(self, inp: RenderTextInput) -> Result[RenderTextOutput]:
+        """Render text to a PNG file using Pillow."""
+        warnings: list[str] = []
+        if inp.align not in {"left", "center", "right"}:
+            return Result.fail(f"unsupported align: {inp.align}; valid: left, center, right")
+        # Normalize colors.
+        color = inp.color if inp.color.startswith("#") else f"#{inp.color}"
+        bg = inp.background_color if inp.background_color.startswith("#") else f"#{inp.background_color}"
+        try:
+            output = self.renderer.render(
+                text=inp.text,
+                output_path=inp.output_path,
+                font_size=inp.font_size,
+                color=color,
+                background_color=bg,
+                width=inp.width,
+                height=inp.height,
+                x=inp.x,
+                y=inp.y,
+                font_path=inp.font_path,
+                align=inp.align,
+            )
+        except Exception as exc:
+            return Result.fail(f"text rendering failed: {exc}")
+        return Result.ok(RenderTextOutput(
+            output_path=output,
+            width=inp.width,
+            height=inp.height,
             warnings=warnings,
         ))
 

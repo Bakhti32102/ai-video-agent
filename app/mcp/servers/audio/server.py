@@ -21,11 +21,13 @@ Legacy tools (backward compat):
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 from typing import Any
 
 from app.core.enums import AgentName
 from app.core.exceptions import AppError
-from app.core.logging import get_logger
+from app.core.logging import get_logger, log_event
 from app.core.result import Result
 from app.mcp.schemas import (
     CreateAudioTimelineInput,
@@ -41,12 +43,18 @@ from app.utils.paths import contains_traversal, validate_path_safety
 
 logger = get_logger("mcp.audio")
 
+# Parse ffmpeg silencedetect log lines:
+#   [silencedetect @ ...] silence_start: 12.3400
+#   [silencedetect @ ...] silence_end: 13.5600 | silence_duration: 1.2200
+_SILENCE_START_RE = re.compile(r"silence_start:\s*([\d.]+)")
+_SILENCE_END_RE = re.compile(r"silence_end:\s*([\d.]+)\s*\|\s*silence_duration:\s*([\d.]+)")
+
 
 class AudioMcpServer(BaseMcpServer):
     """Analyzes voice-over audio and produces timestamps / silence map."""
 
     name = AgentName.AUDIO
-    version = "3.0.0"
+    version = "4.0.0"
     description = "Inspects voice-over audio: duration, sample rate, channels, codec, silence."
 
     def __init__(self, ffmpeg_service: FFmpegService | None = None) -> None:
@@ -164,12 +172,88 @@ class AudioMcpServer(BaseMcpServer):
     async def _detect_silence(self, inp: DetectSilenceInput) -> Result[DetectSilenceOutput]:
         if contains_traversal(inp.file_path):
             return Result.fail(f"path traversal detected: {inp.file_path}")
-        # Try real silence detection via ffprobe/ffmpeg silencedetect.
-        # The interface is ready; actual silencedetect requires the filter
-        # which needs the file to exist. For now, return empty with a warning.
-        warnings = ["silence detection interface ready; full silencedetect filter integration pending"]
+        try:
+            validate_path_safety(inp.file_path, allow_absolute=True)
+        except Exception as exc:
+            return Result.fail(f"unsafe audio path: {exc}")
+
+        warnings: list[str] = []
+        # Try real silence detection via ffmpeg silencedetect filter.
+        # Only the concrete FFmpegRenderer has the binary; the stub cannot.
+        from app.services.ffmpeg import FFmpegRenderer, StubFFmpegService
+        if isinstance(self.ffmpeg, StubFFmpegService):
+            warnings.append("ffmpeg unavailable; silence detection not performed")
+            return Result.ok(DetectSilenceOutput(
+                file_path=inp.file_path,
+                silence_segments=[],
+                warnings=warnings,
+            ))
+        if not os.path.exists(inp.file_path):
+            return Result.fail(f"audio file does not exist: {inp.file_path}")
+
+        try:
+            segments = self._run_silencedetect(inp.file_path, inp.min_silence_sec)
+        except FileNotFoundError as exc:
+            warnings.append(f"ffmpeg binary not found: {exc}")
+            return Result.ok(DetectSilenceOutput(
+                file_path=inp.file_path, silence_segments=[], warnings=warnings,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"silence detection failed: {exc}")
+            return Result.ok(DetectSilenceOutput(
+                file_path=inp.file_path, silence_segments=[], warnings=warnings,
+            ))
+        if not segments:
+            warnings.append("no silence segments detected")
         return Result.ok(DetectSilenceOutput(
             file_path=inp.file_path,
-            silence_segments=[],
+            silence_segments=segments,
             warnings=warnings,
         ))
+
+    def _run_silencedetect(self, file_path: str, min_silence_sec: float) -> list[dict[str, Any]]:
+        """Run ffmpeg silencedetect and parse the log output.
+
+        Uses subprocess argv list (never shell=True). Returns a list of
+        ``{start_time, end_time, duration_sec, confidence}`` dicts.
+        """
+        renderer = self.ffmpeg
+        # FFmpegRenderer is guaranteed here; access its binary path.
+        ffmpeg_bin = getattr(renderer, "ffmpeg_bin", "ffmpeg")
+        cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-i", str(file_path),
+            "-af", f"silencedetect=noise=-50dB:d={min_silence_sec}",
+            "-f", "null",
+            "-",
+        ]
+        log_event(logger, "silencedetect.start", file=file_path)
+        result = subprocess.run(  # noqa: S603 - argv list, no shell
+            cmd, capture_output=True, text=True, timeout=120, check=False,
+        )
+        # silencedetect writes to stderr.
+        log_output = result.stderr or ""
+        return self._parse_silence_log(log_output)
+
+    @staticmethod
+    def _parse_silence_log(log_output: str) -> list[dict[str, Any]]:
+        """Parse ffmpeg silencedetect stderr output into segments."""
+        segments: list[dict[str, Any]] = []
+        starts: list[float] = []
+        for line in log_output.splitlines():
+            m = _SILENCE_START_RE.search(line)
+            if m:
+                starts.append(float(m.group(1)))
+            m = _SILENCE_END_RE.search(line)
+            if m:
+                end = float(m.group(1))
+                dur = float(m.group(2))
+                start = starts.pop(0) if starts else end - dur
+                segments.append({
+                    "start_time": round(start, 3),
+                    "end_time": round(end, 3),
+                    "duration_sec": round(dur, 3),
+                    "confidence": 1.0,
+                })
+        return segments
