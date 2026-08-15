@@ -413,6 +413,44 @@ class BuildAudioMixOutput(ToolOutput):
     warnings: list[str] = Field(default_factory=list)
 
 
+class SoundTrackSpec(ToolInput):
+    """A single timed sound track (SFX/ambience) for mixing."""
+
+    file_path: str = Field(min_length=1, description="Path to the audio file (must exist)")
+    start_time: float = Field(default=0.0, ge=0.0, description="Start position in the mix timeline (seconds)")
+    volume_db: float = Field(default=0.0, ge=-60.0, le=12.0)
+    fade_in_sec: float = Field(default=0.0, ge=0.0, le=10.0)
+    fade_out_sec: float = Field(default=0.0, ge=0.0, le=10.0)
+    duration_sec: float | None = Field(default=None, gt=0.0, le=600.0, description="Optional trim length")
+
+
+class MixAudioInput(ToolInput):
+    """Mix voiceover + timed SFX + music into a real audio file via FFmpeg."""
+
+    output_filename: str = Field(
+        min_length=1, max_length=255,
+        description="Output filename (relative to the output directory)",
+    )
+    voiceover_path: str | None = Field(default=None, min_length=1, description="Path to voice-over audio file")
+    voiceover_volume_db: float = Field(default=0.0, ge=-60.0, le=12.0)
+    sfx_tracks: list[SoundTrackSpec] = Field(default_factory=list)
+    music_path: str | None = Field(default=None, min_length=1)
+    music_volume_db: float = Field(default=-18.0, ge=-60.0, le=12.0)
+    duration_sec: float | None = Field(default=None, gt=0.0, le=600.0, description="Target mix duration")
+    sample_rate: int = Field(default=44100, ge=8000, le=192000)
+    channels: int = Field(default=1, ge=1, le=2)
+    format: str = Field(default="wav", pattern=r"^(wav|aac|m4a)$")
+
+
+class MixAudioOutput(ToolOutput):
+    output_path: str
+    duration_sec: float | None = None
+    sample_rate: int | None = None
+    channels: int | None = None
+    track_count: int
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ValidateSoundEventInput(ToolInput):
     asset_id: str = Field(pattern=r"^[A-Za-z0-9_\-]{1,64}$")
     start_time: float = Field(ge=0.0)
@@ -570,11 +608,14 @@ __all__ = [
     "CreateSoundEventInput", "CreateSoundEventOutput",
     "CreateSoundDesignPlanInput", "CreateSoundDesignPlanOutput",
     "ValidateSoundEventInput", "ValidateSoundEventOutput",
+    "BuildAudioMixInput", "BuildAudioMixOutput",
+    "SoundTrackSpec", "MixAudioInput", "MixAudioOutput",
     # Render
     "CreateRenderJobInput", "CreateRenderJobOutput",
     "ValidateRenderJobInput", "ValidateRenderJobOutput",
     "RenderVideoInput", "RenderVideoOutput",
     "GetRenderStatusInput", "GetRenderStatusOutput",
+    "ComposeVideoInput", "ComposeVideoOutput",
     # QA
     "ValidateProjectInput", "ValidateProjectOutput",
     "CreateQaReportInput", "CreateQaReportOutput",

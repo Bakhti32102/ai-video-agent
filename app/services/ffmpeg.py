@@ -110,6 +110,45 @@ class ComposeVideoParams:
     format: str = "mp4"
 
 
+@dataclass
+class AudioTrack:
+    """A single timed audio track for mixing (SFX or ambience).
+
+    ``start_time`` positions the track in the final timeline (seconds).
+    ``volume_db`` adjusts gain; ``fade_in_sec``/``fade_out_sec`` apply fades.
+    """
+
+    file_path: str
+    start_time: float = 0.0
+    volume_db: float = 0.0
+    fade_in_sec: float = 0.0
+    fade_out_sec: float = 0.0
+    # Optional clip duration limit (trims the track to this length).
+    duration_sec: float | None = None
+
+
+@dataclass
+class MixAudioParams:
+    """Parameters for mixing voiceover + timed SFX + music into one audio file.
+
+    The output is a single WAV/AAC file suitable for muxing into the final
+    video. All input paths are validated and must exist. ``duration_sec`` pads
+    or trims the mix to the target length so it matches the video duration.
+    """
+
+    output_path: str
+    voiceover_path: str | None = None
+    voiceover_volume_db: float = 0.0
+    sfx_tracks: list[AudioTrack] = field(default_factory=list)
+    music_path: str | None = None
+    music_volume_db: float = -18.0
+    # Target duration: the mix is padded with silence / trimmed to this length.
+    duration_sec: float | None = None
+    sample_rate: int = 44100
+    channels: int = 1
+    format: str = "wav"
+
+
 class FFmpegService(ABC):
     """Abstract media processing service backed by FFmpeg."""
 
@@ -127,6 +166,17 @@ class FFmpegService(ABC):
         """
         raise AppError(
             "video composition is not available in this environment",
+            code="NOT_IMPLEMENTED",
+        )
+
+    async def mix_audio(self, params: MixAudioParams) -> str:
+        """Mix voiceover + optional timed SFX + optional music into one audio file.
+
+        Default implementation is unavailable; concrete FFmpegRenderer
+        overrides this for real audio mixing via subprocess.
+        """
+        raise AppError(
+            "audio mixing is not available in this environment",
             code="NOT_IMPLEMENTED",
         )
 
@@ -283,6 +333,146 @@ class FFmpegRenderer(FFmpegService):
             )
         log_event(logger, "ffmpeg.compose.done", output=str(output), size=output.stat().st_size)
         return str(output)
+
+    async def mix_audio(self, params: MixAudioParams) -> str:
+        """Mix voiceover + timed SFX + music into a single audio file via FFmpeg.
+
+        Builds a ``-filter_complex`` graph that:
+        - normalizes every input to the target sample rate / channel layout,
+        - delays each SFX track to its ``start_time``,
+        - applies per-track volume (dB) and fade in/out,
+        - sums everything with ``amix`` (``duration=longest``),
+        - pads the result to ``duration_sec`` so it matches the video length.
+
+        If only a voiceover is supplied (no SFX/music), the voiceover is
+        normalized and padded to the target duration (no mixing needed).
+        If no inputs at all, a silent track of ``duration_sec`` is produced.
+        All paths are validated; no input is fabricated.
+        """
+        output = self._validate_output_path(params.output_path)
+        cmd = self._build_mix_audio_command(params, output)
+        log_event(
+            logger, "ffmpeg.mix_audio.start", output=str(output),
+            sfx=len(params.sfx_tracks), music=bool(params.music_path),
+            voiceover=bool(params.voiceover_path),
+        )
+        try:
+            result = self._run_subprocess(cmd)
+        except FileNotFoundError as exc:
+            raise AppError(
+                f"ffmpeg binary not found at '{self.ffmpeg_bin}'",
+                code="FFMPEG_NOT_FOUND",
+            ) from exc
+        if result.returncode != 0:
+            raise RenderError(
+                f"ffmpeg mix_audio failed (exit {result.returncode}): {result.stderr[:800]}",
+                details={"output": str(output), "stderr": result.stderr[:2000]},
+            )
+        if not output.exists():
+            raise RenderError(
+                f"ffmpeg reported success but output file not found: {output}",
+                details={"output": str(output)},
+            )
+        log_event(logger, "ffmpeg.mix_audio.done", output=str(output), size=output.stat().st_size)
+        return str(output)
+
+    def _build_mix_audio_command(self, params: MixAudioParams, output: Path) -> list[str]:
+        """Build the ffmpeg argv for mixing voiceover + SFX + music.
+
+        Filtergraph structure:
+          [0:a]aformat,volume?[vo0]            (voiceover, optional volume)
+          [i:a]aformat,atrim?,volume?,afade?,adelay?[sfxi]  (timed SFX)
+          [j:a]aformat,volume?[mus0]           (music, optional volume)
+          [vo0][sfx..][mus0]amix=inputs=N:duration=longest[aout]
+        Then padded/trimmed to ``duration_sec``. No input is fabricated.
+        """
+        sr = params.sample_rate
+        ch = params.channels
+        layout = "mono" if ch == 1 else "stereo"
+        aformat = f"aformat=sample_rates={sr}:channel_layouts={layout}"
+
+        cmd: list[str] = [self.ffmpeg_bin, "-y"]
+        idx = 0
+
+        # --- Inputs (validated, must exist) ---
+        if params.voiceover_path:
+            vo_path = self._validate_input_path(params.voiceover_path, must_exist=True)
+            cmd.extend(["-i", str(vo_path)])
+            idx += 1
+        for track in params.sfx_tracks:
+            sfx_path = self._validate_input_path(track.file_path, must_exist=True)
+            cmd.extend(["-i", str(sfx_path)])
+            idx += 1
+        if params.music_path:
+            music_path = self._validate_input_path(params.music_path, must_exist=True)
+            cmd.extend(["-i", str(music_path)])
+            idx += 1
+
+        # --- Build the per-input filter chains ---
+        filter_parts: list[str] = []
+        mix_labels: list[str] = []
+        pos = 0
+        if params.voiceover_path:
+            chain = f"[{pos}:a]{aformat}"
+            if params.voiceover_volume_db != 0.0:
+                chain += f",volume={params.voiceover_volume_db}dB"
+            chain += "[vo0]"
+            filter_parts.append(chain)
+            mix_labels.append("[vo0]")
+            pos += 1
+        for i, track in enumerate(params.sfx_tracks):
+            chain = f"[{pos}:a]{aformat}"
+            if track.duration_sec is not None and track.duration_sec > 0:
+                chain += f",atrim=duration={track.duration_sec}"
+            if track.volume_db != 0.0:
+                chain += f",volume={track.volume_db}dB"
+            if track.fade_in_sec > 0:
+                chain += f",afade=t=in:st=0:d={track.fade_in_sec}"
+            delay_ms = int(round(max(track.start_time, 0.0) * 1000))
+            if delay_ms > 0:
+                chain += f",adelay={delay_ms}|{delay_ms}"
+            chain += f"[sfx{i}]"
+            filter_parts.append(chain)
+            mix_labels.append(f"[sfx{i}]")
+            pos += 1
+        if params.music_path:
+            chain = f"[{pos}:a]{aformat}"
+            if params.music_volume_db != 0.0:
+                chain += f",volume={params.music_volume_db}dB"
+            chain += "[mus0]"
+            filter_parts.append(chain)
+            mix_labels.append("[mus0]")
+            pos += 1
+
+        # No audio inputs at all: produce silence of the target duration.
+        if not mix_labels:
+            dur = params.duration_sec or 1.0
+            return [
+                self.ffmpeg_bin, "-y", "-f", "lavfi",
+                "-i", f"anullsrc=channel_layout={layout}:sample_rate={sr}:duration={dur}",
+                "-c:a", "pcm_s16le", "-ar", str(sr), "-ac", str(ch),
+                "-t", str(dur), str(output),
+            ]
+
+        mix_chain = (
+            f"{''.join(mix_labels)}"
+            f"amix=inputs={len(mix_labels)}:duration=longest:dropout_transition=0[aout]"
+        )
+        filter_parts.append(mix_chain)
+        filtergraph = ";".join(filter_parts)
+        cmd.extend(["-filter_complex", filtergraph])
+
+        acodec = "pcm_s16le" if params.format.lower() == "wav" else "aac"
+        cmd.extend([
+            "-map", "[aout]",
+            "-c:a", acodec,
+            "-ar", str(sr),
+            "-ac", str(ch),
+        ])
+        if params.duration_sec is not None:
+            cmd.extend(["-t", str(params.duration_sec)])
+        cmd.extend(["-shortest", str(output)])
+        return cmd
 
     def _build_compose_command(self, params: ComposeVideoParams, output: Path) -> list[str]:
         """Build the ffmpeg argv for composing background + overlays + audio."""

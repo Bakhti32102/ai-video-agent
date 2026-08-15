@@ -174,8 +174,14 @@ class SupervisorAgent:
         voiceover_path: str | None = None,
         audio_duration_sec: float | None = None,
         total_duration_sec: float = 30.0,
+        sfx_paths: list[str] | None = None,
+        music_path: str | None = None,
     ) -> dict[str, Any]:
         """Run the full 9-step orchestration workflow.
+
+        Optional ``sfx_paths`` and ``music_path`` (Phase 5B) supply real audio
+        asset files to mix with the voiceover. When omitted (or when the files
+        do not exist), the pipeline falls back to voiceover-only mixing.
 
         Returns a dict with the final workflow state, all agent results, and
         the QA report. If any step fails after retries, the workflow
@@ -417,6 +423,68 @@ class SupervisorAgent:
             context["sound_events"] = sound_result.output.get("events", [])
         state = self._advance_state(state, WorkflowStateEnum.GENERATING_SOUND)
 
+        # Step 8b: Sound MCP — build the real mixed audio track.
+        # Turn the structured sound design + the (optional) caller-supplied
+        # SFX/music files into a single audio file via the mix_audio tool. Only
+        # assets that exist on disk are mixed; missing optional assets are
+        # skipped (never fabricated). The resulting mixed audio (voiceover +
+        # SFX + music) is muxed into the final video in place of the raw
+        # voiceover, so all sound layers reach the MP4.
+        mixed_audio_path: str | None = None
+        duration = context["audio_duration_sec"] or total_duration_sec
+        # Collect real, on-disk SFX tracks with scene timing. Map each
+        # supplied SFX file to a scene's start_time so it is positioned in the
+        # timeline; files that don't exist are dropped (safe default).
+        sfx_specs: list[dict[str, Any]] = []
+        if sfx_paths:
+            for i, sp in enumerate(sfx_paths):
+                if not sp:
+                    continue
+                # Position each SFX at the start of the i-th scene when known.
+                scene_start = 0.0
+                if i < len(scenes):
+                    scene_start = float(scenes[i].get("start_time", 0.0))
+                sfx_specs.append({
+                    "file_path": sp,
+                    "start_time": scene_start,
+                    "volume_db": -6.0,
+                    "fade_in_sec": 0.0,
+                    "fade_out_sec": 0.0,
+                })
+        # Only invoke mix_audio when there is something to mix beyond the raw
+        # voiceover, OR when we want a normalized/padded voiceover track. We
+        # always invoke it so the audio is padded to the exact video duration
+        # and normalized; if it fails, fall back to the raw voiceover path.
+        mix_args: dict[str, Any] = {
+            "output_filename": f"{project_id}_mixed.wav",
+            "duration_sec": duration,
+            "sample_rate": 44100,
+            "channels": 1,
+            "format": "wav",
+        }
+        if voiceover_path:
+            mix_args["voiceover_path"] = voiceover_path
+        if sfx_specs:
+            mix_args["sfx_tracks"] = sfx_specs
+        if music_path:
+            mix_args["music_path"] = music_path
+        mix_result = await self.run_agent(AgentName.SOUND, "mix_audio", mix_args)
+        results["sound_mix"] = mix_result
+        if mix_result.success and mix_result.output:
+            mixed_audio_path = mix_result.output.get("output_path")
+            context["mixed_audio_path"] = mixed_audio_path
+            context["sound_mix"] = mix_result.output
+        else:
+            # Mixing failed (e.g. StubFFmpegService in test env, or no ffmpeg).
+            # Fall back to the raw voiceover so the pipeline keeps working.
+            logger.warning(
+                "supervisor.sound.mix_failed",
+                extra={"project_id": project_id, "errors": mix_result.errors},
+            )
+            if voiceover_path:
+                mixed_audio_path = voiceover_path
+        state = self._advance_state(state, WorkflowStateEnum.GENERATING_SOUND)
+
         # Step 9: Render MCP — compose the final video with overlays.
         # Build overlay list: map PNGs first (as full-frame-ish backgrounds for
         # their scenes), then text overlays on top. Map overlays are timed to
@@ -457,7 +525,12 @@ class SupervisorAgent:
             "background_color": "#1a1a2e",
             "overlays": compose_overlays,
         }
-        if voiceover_path:
+        if mixed_audio_path:
+            # Use the mixed audio track (voiceover + SFX + music) so all
+            # sound layers reach the final MP4. Falls back to raw voiceover
+            # when mixing was unavailable.
+            compose_args["audio_path"] = mixed_audio_path
+        elif voiceover_path:
             compose_args["audio_path"] = voiceover_path
         compose_result = await self.run_agent(AgentName.RENDER, "compose_video", compose_args)
         results["render"] = compose_result
@@ -608,6 +681,8 @@ class SupervisorAgent:
             "text_overlays": context.get("text_overlays", []),
             "transitions": context.get("transitions", []),
             "sound_events": context.get("sound_events", []),
+            "mixed_audio_path": context.get("mixed_audio_path"),
+            "sound_mix": context.get("sound_mix"),
             "results": {k: v.model_dump(mode="json") for k, v in results.items()},
             "qa_report": results.get("qa", AgentResult(
                 agent=AgentName.QA, status="failed", success=False, errors=["QA not run"]
