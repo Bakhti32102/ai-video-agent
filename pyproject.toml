@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-video-agent"
+version = "0.1.0"
+description = "Production-oriented AI Video Automation Agent (MCP-based, open-source)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "AI Video Agent" }]
+keywords = ["video", "automation", "mcp", "documentary", "map", "ffmpeg"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "SQLAlchemy>=2.0.29",
+    "ffmpeg-python>=0.2.0",
+    "geojson>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Bakhti32102/ai-video-agent"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
