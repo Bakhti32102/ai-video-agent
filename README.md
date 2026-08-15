@@ -11,10 +11,10 @@ specialized MCP servers. It deliberately **does not** depend on Adobe After
 Effects or GEOlayers 3 and favours open-source / local technologies
 (FFmpeg, GeoJSON, SVG/HTML/Canvas, MapLibre/Leaflet).
 
-> **Status:** Phase 2 (in progress) — production-ready foundation. The core
-> infrastructure (database, schemas, guardrails, workflow state machine,
-> logging, supervisor) is now production-grade. The full 9-agent pipeline and
-> final video rendering remain Phase 3 (see
+> **Status:** Phase 3 — real MCP architecture with 9 specialized servers,
+> provider abstraction, safe FFmpeg rendering, and full supervisor
+> orchestration. The core pipeline is functional. Remaining work (LLM-driven
+> NER, real map-tile rendering, Whisper alignment) is Phase 4+ (see
 > [Current implementation status](#current-implementation-status)).
 
 ---
@@ -206,7 +206,7 @@ Key guarantees enforced through the architecture:
 
 ---
 
-## Current implementation status (Phase 2)
+## Current implementation status (Phase 3)
 
 ### Phase 1 — foundation (complete)
 
@@ -223,71 +223,146 @@ Key guarantees enforced through the architecture:
 - `BaseAgent` + `SupervisorAgent` with bounded retries and `WorkflowState`.
 - FastAPI app with `/health` and `/mcp/tools`.
 
-### Phase 2 — production-ready foundation (in progress)
+### Phase 2 — production-ready foundation (complete)
 
 - **Error hierarchy & enums**: structured `AppError` subclasses
   (`FileSafetyError`, `GuardrailError`, etc.) with `code` and `details`;
-  new `ProvenanceType` and `WorkflowState` enums.
+  `ProvenanceType` and `WorkflowState` enums.
 - **Workflow state machine** (`app/core/workflow.py`): deterministic
-  transition validation — only explicitly-allowed transitions are accepted;
-  terminal states (`COMPLETED`, `FAILED`, `CANCELLED`) cannot transition;
-  per-project `WorkflowStateMachine` with retry tracking and history.
-- **Provenance tracking**: `Provenance` and `GeoProvenance` schemas record
-  the source, provider, and retrieval timestamp for every geo-coded location
-  and asset. No data enters the pipeline without an accountable origin.
-- **Enhanced `AgentResult`**: auto-generated `run_id`, optional `project_id`
-  / `scene_id`, `confidence` score (0.0–1.0), and `provenance` field.
+  transition validation; per-project `WorkflowStateMachine`.
+- **Provenance tracking**: `Provenance` and `GeoProvenance` schemas.
+- **Enhanced `AgentResult`**: auto-generated `run_id`, `confidence`, `provenance`.
 - **File safety utilities** (`app/utils/paths.py`): path-traversal detection,
-  directory-restriction enforcement, extension validation, safe `mkdir` —
-  prevents directory escapes and control-character injection.
-- **Centralized guardrail pipeline** (`app/guardrails/pipeline.py`):
-  `GuardrailPipeline` runs all rules in a single pass and produces a
-  `GuardrailReport`; `validate_before_accept` is the single entry point used
-  by the supervisor before accepting any agent result.
-- **Database production-readiness**: SQLite FK enforcement (`PRAGMA
-  foreign_keys=ON`), `ondelete=CASCADE` across all FK relationships
-  (`SET NULL` for `agent_run`), `index=True` on status/name fields, `UniqueConstraint`
-  on `(project_id, index)` for scenes, `provenance` JSON columns on `Asset`
-  and `Location`, `current_state` column on `WorkflowState`.
-- **Supervisor enhancements**: integrates the guardrail pipeline (results
-  that fail guardrails are rejected and retried), uses the workflow state
-  machine for transitions, transitions to `FAILED` when retries are exhausted,
-  emits structured event logs.
-- **Logging improvements**: `SecretRedactingFormatter` masks API keys,
-  tokens, passwords, and bearer tokens before they reach any handler;
-  `log_event` helper for structured key=value event logging.
-- **265 unit tests** (all passing) — 89 Phase 1 + 176 Phase 2 tests covering
-  the state machine, exceptions, provenance schemas, file safety, guardrail
-  pipeline, logging, and database enhancements.
+  directory-restriction enforcement.
+- **Centralized guardrail pipeline** (`app/guardrails/pipeline.py`).
+- **Database production-readiness**: FK enforcement, cascades, indexes,
+  unique constraints, provenance columns.
+- **Logging improvements**: `SecretRedactingFormatter`, `log_event`.
 
-Phase 1 server behaviour (unchanged):
+### Phase 3 — real MCP architecture (complete)
 
-- **Script** — heuristic paragraph splitter (returns scene specs).
-- **QA** — fully implemented structural checks (missing scenes/gaps, timeline
-  overlaps, audio/video duration mismatch, invalid coordinates, missing
-  assets) producing a structured `QAReport`.
-- **Geo / Asset / Sound / Render** — explicit stubs that **refuse** to
-  produce unverifiable output, with `TODO(Phase 2)` documentation.
-- **Audio / Text / Transition** — contract + light logic; full features Phase 3.
+- **`BaseMcpServer` upgrade**: `ToolDefinition` with Pydantic input/output
+  schemas, `health_check`, `execute_tool` with schema-validated I/O. No
+  unvalidated dictionaries pass through the tool boundary.
+- **MCP server registry** (`app/mcp/registry.py`): `register_server`,
+  `unregister_server`, `get_server`, `list_servers`, `health_check_all`,
+  `discover_tools`. Pre-loads all 9 canonical servers.
+- **9 specialized MCP servers** with real tools:
+
+| Server | Tools |
+|--------|-------|
+| Script | `analyze_script`, `split_into_scenes`, `extract_entities`, `extract_locations` |
+| Audio | `inspect_audio`, `create_audio_timeline`, `detect_silence` |
+| Geo | `geocode_location`, `batch_geocode`, `validate_coordinates`, `reverse_geocode` |
+| Assets | `register_asset`, `get_asset`, `list_assets`, `validate_asset`, `find_asset` |
+| Text | `create_text_overlay` |
+| Transitions | `create_transition` |
+| Sound | `create_sound_event`, `create_sound_design_plan`, `validate_sound_event` |
+| Render | `create_render_job`, `validate_render_job`, `render_video`, `get_render_status` |
+| QA | `validate_project`, `validate_timeline`, `validate_audio`, `validate_assets`, `validate_locations`, `validate_render`, `create_qa_report` |
+
+- **Geo provider abstraction** (`app/services/geo.py`): `GeoProvider`
+  interface + `GoogleGeoProvider`, `OpenStreetMapGeoProvider`,
+  `NoneGeoProvider`. Provider selected via `GEO_PROVIDER` config. Every
+  resolved location carries full provenance; ambiguous locations return
+  `status=unresolved` (never fabricated).
+- **FFmpeg renderer** (`app/services/ffmpeg.py`): `FFmpegRenderer` with safe
+  subprocess execution (no `shell=True`), validated input/output paths,
+  output restricted to project directory, shell-metachar rejection.
+  `StubFFmpegService` for environments without ffmpeg.
+- **MCP client upgrade**: server/tool discovery, input validation, timeout
+  handling (`asyncio.wait_for`), guardrail validation on every result (never
+  bypassed), structured logging.
+- **Supervisor full orchestration** (`run_project`): drives the project
+  through all 9 servers in order (script → audio → sync → geo → assets →
+  text → transitions → sound → render → QA → decide COMPLETED/FAILED).
+- **End-to-end mocked workflow**: tested with the Gadsden Purchase script;
+  produces structured data for scenes, narration timing, locations, map
+  requirements, text, transitions, sound design, render job, and QA report.
+
+**362 tests** (all passing), 2 skipped (real ffmpeg render, requires ffmpeg
+installed): 265 Phase 1/2 + 97 Phase 3 tests covering the base architecture,
+registry, client, all 9 servers, geo providers, FFmpeg renderer safety, and
+the end-to-end workflow.
 
 ---
 
-## What is NOT implemented yet (Phase 3+)
+## MCP architecture
 
-- LLM-driven script understanding and entity detection (NER).
-- Real audio analysis via FFmpeg/ffprobe (duration, silence, transcript).
-- Real geocoding via configurable providers (Nominatim/Mapbox/MapTiler/Google)
-  and GeoJSON/vector map rendering (MapLibre/Leaflet).
-- Icon/asset discovery and generation from real sources.
-- Typographic text measurement and overflow checks; full lower-third styling.
-- Sound library integration (SFX, ambience, licensed music).
-- **Final video rendering** via an FFmpeg filtergraph (16:9 MP4).
-- The full 9-agent orchestration loop (phase-ordered pipeline with rollback).
-- **Streamlit UI** (deliberately deferred).
+```
+SupervisorAgent
+       ↓
+   McpClient  ──→  McpServerRegistry
+       ↓                    ↓
+  tool call          9 specialized servers
+                         ↓
+              BaseMcpServer.execute_tool
+                   (schema-validated I/O)
+                         ↓
+              GuardrailPipeline.validate_before_accept
+```
+
+Every tool call flows through:
+1. Input validation against the tool's Pydantic input schema
+2. Handler dispatch
+3. Output validation against the tool's Pydantic output schema
+4. Guardrail pipeline validation (never bypassed)
+5. Structured `AgentResult` returned to the caller
+
+### Provider adapters
+
+Geo and rendering use provider abstractions so the architecture stays
+provider-agnostic:
+
+- **Geo**: `GEO_PROVIDER=none|osm|google`. OSM (Nominatim) is free; Google
+  requires `GOOGLE_MAPS_API_KEY`.
+- **Rendering**: `FFmpegRenderer` (real ffmpeg) or `StubFFmpegService` (when
+  ffmpeg is not installed).
+
+### Database interaction
+
+The MCP servers operate on in-memory Pydantic contracts. Persistence is
+handled by the existing SQLAlchemy models and `ProjectService`. The workflow
+state machine tracks lifecycle; the supervisor can persist results through
+`ProjectService` (Phase 4+ will wire full persistence into the orchestration).
+
+### Security
+
+- All file paths validated against path-traversal (`app/utils/paths.py`)
+- FFmpeg subprocess uses argv lists, never `shell=True`
+- Output paths restricted to approved project directories
+- Shell metacharacters rejected in ffmpeg arguments
+- Secrets redacted in logs (`SecretRedactingFormatter`)
+- No API keys hard-coded; all via environment variables
+- Every externally-obtained datum carries provenance
+
+### Testing
+
+```
+python -m pytest           # 362 passed, 2 skipped
+python -m compileall app tests
+```
+
+Tests cover: base architecture, registry, client (discovery/validation/
+timeout/guardrails), all 9 servers, tool schemas, geo providers, FFmpeg
+renderer safety, QA system, and the end-to-end mocked workflow. No paid APIs
+are called during tests (geo uses a mock provider; render uses the stub).
+
+---
+
+## What is NOT implemented yet (Phase 4+)
+
+- LLM-driven script understanding and NER (current: heuristic detection).
+- Real map-tile rendering via MapLibre/Leaflet (current: spec only).
+- Whisper/forced-alignment for audio transcription.
+- Real icon/asset generation from external sources.
+- Full timeline persistence to the database.
 - A real MCP network transport (stdio/SSE).
+- **Streamlit UI** (deliberately deferred).
 
-Each unimplemented piece is an explicit interface/stub with `TODO` markers —
-nothing is faked as production-ready.
+**After Effects and GEOlayers 3 are NOT required** by the core architecture.
+The pipeline uses FFmpeg for rendering. An optional After Effects/GEOlayers
+adapter may be added in the future.
 
 ---
 

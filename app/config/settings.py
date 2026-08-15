@@ -19,8 +19,8 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
 
 AppEnv = Literal["development", "staging", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-MapProvider = Literal["nominatim", "mapbox", "maptiler", "google", "none"]
-LlmProvider = Literal["openai", "openrouter", "google", "none"]
+GeoProvider = Literal["none", "osm", "google"]
+LlmProvider = Literal["none", "openai", "openrouter", "google"]
 
 
 class Settings(BaseSettings):
@@ -51,7 +51,10 @@ class Settings(BaseSettings):
     google_api_key: str = ""
 
     # --- Map / geocoding ---
-    map_provider: MapProvider = "none"
+    geo_provider: GeoProvider = "none"
+    google_maps_api_key: str = ""
+    # Legacy aliases kept for backward compatibility with Phase 2 callers.
+    map_provider: str = "none"
     map_api_key: str = ""
 
     # --- FFmpeg ---
@@ -111,7 +114,8 @@ class Settings(BaseSettings):
             "openai": bool(self.openai_api_key),
             "openrouter": bool(self.openrouter_api_key),
             "google": bool(self.google_api_key),
-            "map": bool(self.map_api_key),
+            "google_maps": bool(self.google_maps_api_key),
+            "geo": bool(self.google_maps_api_key or self.geo_provider == "osm"),
         }
 
 
