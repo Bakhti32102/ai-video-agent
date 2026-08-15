@@ -35,6 +35,7 @@ from app.guardrails.guardrails import Guardrails
 from app.guardrails.pipeline import GuardrailPipeline, validate_before_accept
 from app.mcp.client import McpClient
 from app.schemas.contracts import AgentResult, WorkflowState
+from app.services.geo import normalize_geo_query
 from app.utils.ids import new_id
 
 logger = get_logger("agent.supervisor")
@@ -232,13 +233,22 @@ class SupervisorAgent:
         state = self._advance_state(state, WorkflowStateEnum.BUILDING_SCENES)
 
         # Step 4: Geo MCP — resolve locations.
+        # Build a name->geocode cache so repeated locations (e.g. "mexico"
+        # appearing in multiple scenes) are geocoded once.
+        geo_cache: dict[str, dict[str, Any]] = {}
         geo_results: list[dict[str, Any]] = []
         for loc in context.get("locations", []):
             loc_name = loc.get("name", "")
-            if loc_name:
-                geo_result = await self.run_agent(AgentName.GEO, "geocode_location", {"query": loc_name})
-                if geo_result.success and geo_result.output:
-                    geo_results.append(geo_result.output)
+            if not loc_name:
+                continue
+            query = normalize_geo_query(loc_name)
+            if query in geo_cache:
+                continue
+            geo_result = await self.run_agent(AgentName.GEO, "geocode_location", {"query": query})
+            if geo_result.success and geo_result.output:
+                geo_cache[query] = geo_result.output
+                geo_cache[loc_name] = geo_result.output
+                geo_results.append(geo_result.output)
         results["geo"] = AgentResult(
             agent=AgentName.GEO,
             status="success",
@@ -250,20 +260,78 @@ class SupervisorAgent:
         context["resolved_locations"] = geo_results
         state = self._advance_state(state, WorkflowStateEnum.GENERATING_MAPS)
 
-        # Step 4b: Build map plans for resolved locations.
+        # Step 4b: Build map plans for resolved locations and render to PNG.
+        # For every scene that requires a map, find its first resolved
+        # location, build a map plan, render it to a PNG, and record the
+        # path keyed by scene index. Failures are logged and skipped so the
+        # pipeline falls back to the existing visual behavior for that scene.
         map_images: list[dict[str, Any]] = []
-        for loc in geo_results:
-            lat = loc.get("latitude")
-            lon = loc.get("longitude")
-            name = loc.get("name", "location")
-            if lat is not None and lon is not None:
-                map_result = await self.run_agent(
-                    AgentName.GEO, "build_map_plan",
-                    {"location_name": name, "latitude": lat, "longitude": lon, "zoom": 5.0, "width": 1920, "height": 1080},
+        scene_map_paths: dict[int, str] = {}
+        scenes = context.get("scenes", [])
+        for scene in scenes:
+            if not scene.get("map_required"):
+                continue
+            scene_idx = scene.get("index", 0)
+            scene_locations = scene.get("locations", []) or []
+            resolved: dict[str, Any] | None = None
+            for sloc in scene_locations:
+                sname = sloc.get("name", "")
+                if not sname:
+                    continue
+                query = normalize_geo_query(sname)
+                resolved = geo_cache.get(query) or geo_cache.get(sname)
+                if resolved and resolved.get("latitude") is not None and resolved.get("longitude") is not None:
+                    break
+                resolved = None
+            if resolved is None:
+                logger.warning(
+                    "supervisor.map.no_resolved_location",
+                    extra={"scene_index": scene_idx, "locations": [l.get("name") for l in scene_locations]},
                 )
-                if map_result.success and map_result.output:
-                    map_images.append(map_result.output.get("plan", {}))
+                continue
+            lat = resolved.get("latitude")
+            lon = resolved.get("longitude")
+            name = resolved.get("display_name") or resolved.get("query") or "location"
+            plan_result = await self.run_agent(
+                AgentName.GEO, "build_map_plan",
+                {
+                    "location": {
+                        "id": new_id("loc_"),
+                        "name": name,
+                        "latitude": lat,
+                        "longitude": lon,
+                        "source": resolved.get("provider", "unknown"),
+                        "provenance": resolved.get("provenance"),
+                    },
+                    "animation_type": "static",
+                    "scene_id": scene.get("id", ""),
+                    "duration_sec": float(scene.get("duration", scene.get("end_time", 5.0) - scene.get("start_time", 0.0))) or 5.0,
+                    "zoom_start": 5.0,
+                    "style": "default",
+                },
+            )
+            if not (plan_result.success and plan_result.output):
+                logger.warning("supervisor.map.plan_failed", extra={"scene_index": scene_idx})
+                continue
+            plan_dict = plan_result.output.get("plan", {})
+            map_filename = f"map_scene_{scene_idx}_{new_id('')[:8]}.png"
+            render_result = await self.run_agent(
+                AgentName.GEO, "render_map",
+                {"plan": plan_dict, "output_filename": map_filename},
+            )
+            if render_result.success and render_result.output:
+                png_path = render_result.output.get("output_path")
+                if png_path:
+                    scene_map_paths[scene_idx] = png_path
+                    map_images.append({
+                        "scene_index": scene_idx,
+                        "output_path": png_path,
+                        "plan": plan_dict,
+                    })
+            else:
+                logger.warning("supervisor.map.render_failed", extra={"scene_index": scene_idx})
         context["map_images"] = map_images
+        context["scene_map_paths"] = scene_map_paths
 
         # Step 5: Assets MCP — list assets (none registered yet in mock).
         assets_result = await self.run_agent(AgentName.ASSET, "list_assets", {})
@@ -350,8 +418,24 @@ class SupervisorAgent:
         state = self._advance_state(state, WorkflowStateEnum.GENERATING_SOUND)
 
         # Step 9: Render MCP — compose the final video with overlays.
-        # Build overlay list from text overlays (rendered PNGs).
+        # Build overlay list: map PNGs first (as full-frame-ish backgrounds for
+        # their scenes), then text overlays on top. Map overlays are timed to
+        # their scene intervals so each map only appears during its scene.
         compose_overlays: list[dict[str, Any]] = []
+        scene_map_paths = context.get("scene_map_paths", {})
+        scenes = context.get("scenes", [])
+        for scene in scenes:
+            sidx = scene.get("index", 0)
+            map_path = scene_map_paths.get(sidx)
+            if map_path:
+                compose_overlays.append({
+                    "image_path": map_path,
+                    "x": 0.0,
+                    "y": 0.0,
+                    "start_time": float(scene.get("start_time", 0.0)),
+                    "end_time": float(scene.get("end_time", 5.0)),
+                    "opacity": 1.0,
+                })
         for overlay in text_overlays:
             rendered_path = overlay.get("rendered_path")
             if rendered_path:
@@ -519,6 +603,8 @@ class SupervisorAgent:
             "scenes": context.get("scenes", []),
             "audio_duration_sec": context.get("audio_duration_sec"),
             "resolved_locations": context.get("resolved_locations", []),
+            "map_images": context.get("map_images", []),
+            "scene_map_paths": context.get("scene_map_paths", {}),
             "text_overlays": context.get("text_overlays", []),
             "transitions": context.get("transitions", []),
             "sound_events": context.get("sound_events", []),

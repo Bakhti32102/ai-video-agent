@@ -357,6 +357,58 @@ class CachingGeoProvider(GeoProvider):
         return query.strip().lower()
 
 
+# --- Query normalization --------------------------------------------------
+
+# Common place names that need a country/region suffix to disambiguate
+# in geocoding APIs. Keys are matched case-insensitively against the raw
+# extracted location name. Values are the normalized query.
+_DISAMBIGUATION_MAP: dict[str, str] = {
+    # US states that collide with city/region names elsewhere.
+    "arizona": "Arizona, USA",
+    "new mexico": "New Mexico, USA",
+    "georgia": "Georgia, USA",
+    "washington": "Washington, USA",
+    "mexico": "Mexico",
+    "mexico city": "Mexico City, Mexico",
+    "united states": "United States",
+    "united states of america": "United States",
+    "sonora": "Sonora, Mexico",
+    "chihuahua": "Chihuahua, Mexico",
+}
+
+# Known country names that should be title-cased but not suffixed.
+_COUNTRY_NAMES: frozenset[str] = frozenset({
+    "mexico", "canada", "brazil", "argentina", "france", "germany",
+    "spain", "italy", "japan", "china", "india", "russia", "england",
+})
+
+
+def normalize_geo_query(raw_name: str) -> str:
+    """Normalize a raw extracted location name into a geocoding-friendly query.
+
+    The script server extracts locations as lowercase keywords (e.g. "arizona",
+    "new mexico", "mexico city"). Geocoding APIs like Nominatim resolve much
+    better when these are properly qualified. This function:
+    - Checks the disambiguation map first (highest priority).
+    - Title-cases the query so the geocoder receives proper capitalization.
+    - Never fabricates a location: it only re-qualifies a name the script
+      already mentioned.
+
+    Examples:
+        "arizona"      -> "Arizona, USA"
+        "new mexico"   -> "New Mexico, USA"
+        "mexico city"   -> "Mexico City, Mexico"
+        "mesa del osos" -> "Mesa Del Osos"
+    """
+    key = raw_name.strip().lower()
+    if not key:
+        return raw_name
+    if key in _DISAMBIGUATION_MAP:
+        return _DISAMBIGUATION_MAP[key]
+    # Title-case multi-word names; leave country names as-is (already mapped).
+    return raw_name.strip().title()
+
+
 def get_geo_provider(settings: Settings | None = None) -> GeoProvider:
     """Factory: return the configured geo provider.
 
@@ -386,4 +438,5 @@ __all__ = [
     "NoneGeoProvider",
     "OpenStreetMapGeoProvider",
     "get_geo_provider",
+    "normalize_geo_query",
 ]
