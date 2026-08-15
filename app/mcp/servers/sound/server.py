@@ -32,10 +32,14 @@ from app.mcp.schemas import (
     CreateSoundDesignPlanOutput,
     CreateSoundEventInput,
     CreateSoundEventOutput,
+    MixAudioInput,
+    MixAudioOutput,
+    SoundTrackSpec,
     ValidateSoundEventInput,
     ValidateSoundEventOutput,
 )
 from app.mcp.servers.base import BaseMcpServer, ToolDefinition
+from app.services.ffmpeg import AudioTrack, FFmpegService, MixAudioParams, get_ffmpeg_service
 from app.utils.ids import new_id
 
 VALID_KINDS = {
@@ -49,13 +53,14 @@ class SoundMcpServer(BaseMcpServer):
     """Manages SFX, ambience and background music, with audio mixing."""
 
     name = AgentName.SOUND
-    version = "4.0.0"
-    description = "Creates structured sound-design plans and FFmpeg audio mix filtergraphs."
+    version = "5.0.0"
+    description = "Creates structured sound-design plans and mixes voiceover + SFX + music into a real audio track."
 
-    def __init__(self) -> None:
+    def __init__(self, ffmpeg_service: FFmpegService | None = None) -> None:
         super().__init__()
         # Known-good asset IDs (populated via create_sound_event or injected).
         self._known_assets: set[str] = set()
+        self.ffmpeg = ffmpeg_service or get_ffmpeg_service()
         self._register_tool(ToolDefinition(
             name="create_sound_event",
             description="Create a validated sound event spec referencing an existing asset.",
@@ -87,6 +92,14 @@ class SoundMcpServer(BaseMcpServer):
             output_schema=BuildAudioMixOutput,
             handler=self._build_audio_mix,
             tags={"read"},
+        ))
+        self._register_tool(ToolDefinition(
+            name="mix_audio",
+            description="Mix voiceover + timed SFX + music into a real audio file via FFmpeg.",
+            input_schema=MixAudioInput,
+            output_schema=MixAudioOutput,
+            handler=self._mix_audio,
+            tags={"write"},
         ))
 
     async def handle(self, tool: str, arguments: dict[str, Any]) -> Result[Any]:
@@ -220,6 +233,100 @@ class SoundMcpServer(BaseMcpServer):
             filtergraph=filtergraph,
             output_path=inp.output_path,
             input_count=input_idx,
+            warnings=warnings,
+        ))
+
+    async def _mix_audio(self, inp: MixAudioInput) -> Result[MixAudioOutput]:
+        """Mix voiceover + timed SFX + music into a real audio file via FFmpeg.
+
+        This is the Phase 5B execution step that turns the structured sound
+        design into an actual audio file. Only inputs whose files exist on
+        disk are mixed; missing optional assets are skipped (not fabricated).
+        If no inputs exist at all, a silent track of ``duration_sec`` is
+        produced so the caller always gets a valid audio file.
+        """
+        import os
+
+        warnings: list[str] = []
+        # Resolve the output path under the approved output directory.
+        from app.config import get_settings
+        from app.utils.paths import restrict_to_directory
+        try:
+            output_path = str(restrict_to_directory(inp.output_filename, get_settings().output_path))
+        except Exception as exc:  # noqa: BLE001
+            return Result.fail(f"invalid output filename: {exc}")
+
+        # Validate that referenced input files actually exist. Missing optional
+        # assets (SFX/music) are skipped with a warning — never fabricated.
+        voiceover_path = inp.voiceover_path
+        if voiceover_path and not os.path.exists(voiceover_path):
+            warnings.append(f"voiceover path does not exist, skipping: {voiceover_path}")
+            voiceover_path = None
+
+        sfx_tracks: list[AudioTrack] = []
+        for t in inp.sfx_tracks:
+            if os.path.exists(t.file_path):
+                sfx_tracks.append(AudioTrack(
+                    file_path=t.file_path,
+                    start_time=t.start_time,
+                    volume_db=t.volume_db,
+                    fade_in_sec=t.fade_in_sec,
+                    fade_out_sec=t.fade_out_sec,
+                    duration_sec=t.duration_sec,
+                ))
+            else:
+                warnings.append(f"sfx track does not exist, skipping: {t.file_path}")
+
+        music_path = inp.music_path
+        if music_path and not os.path.exists(music_path):
+            warnings.append(f"music path does not exist, skipping: {music_path}")
+            music_path = None
+
+        # If nothing to mix and no duration, we cannot produce a useful file.
+        has_input = voiceover_path is not None or bool(sfx_tracks) or music_path is not None
+        if not has_input and inp.duration_sec is None:
+            return Result.fail("no audio inputs provided and no duration_sec given; cannot mix")
+
+        params = MixAudioParams(
+            output_path=output_path,
+            voiceover_path=voiceover_path,
+            voiceover_volume_db=inp.voiceover_volume_db,
+            sfx_tracks=sfx_tracks,
+            music_path=music_path,
+            music_volume_db=inp.music_volume_db,
+            duration_sec=inp.duration_sec,
+            sample_rate=inp.sample_rate,
+            channels=inp.channels,
+            format=inp.format,
+        )
+        try:
+            mixed_path = await self.ffmpeg.mix_audio(params)
+        except Exception as exc:  # noqa: BLE001
+            return Result.fail(f"audio mix failed: {exc}")
+
+        # Probe the result for reporting (best-effort).
+        duration_sec: float | None = None
+        sample_rate: int | None = None
+        channels: int | None = None
+        try:
+            info = await self.ffmpeg.probe(mixed_path)
+            duration_sec = info.duration_sec
+            sample_rate = info.sample_rate
+            channels = info.channels
+        except Exception:  # noqa: BLE001
+            warnings.append("could not probe mixed audio output")
+
+        track_count = sum([
+            1 if voiceover_path else 0,
+            len(sfx_tracks),
+            1 if music_path else 0,
+        ])
+        return Result.ok(MixAudioOutput(
+            output_path=mixed_path,
+            duration_sec=duration_sec,
+            sample_rate=sample_rate,
+            channels=channels,
+            track_count=track_count,
             warnings=warnings,
         ))
 
