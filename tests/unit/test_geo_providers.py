@@ -6,6 +6,7 @@ import pytest
 
 from app.config import Settings
 from app.services.geo import (
+    CachingGeoProvider,
     GeocodeResult,
     GeoProvider,
     GoogleGeoProvider,
@@ -108,13 +109,16 @@ def test_get_geo_provider_none_default() -> None:
 def test_get_geo_provider_osm() -> None:
     settings = Settings(geo_provider="osm")
     provider = get_geo_provider(settings)
-    assert isinstance(provider, OpenStreetMapGeoProvider)
+    # OSM provider is now wrapped in CachingGeoProvider for rate limiting.
+    assert isinstance(provider, CachingGeoProvider)
+    assert isinstance(provider._inner, OpenStreetMapGeoProvider)
 
 
 def test_get_geo_provider_google() -> None:
     settings = Settings(geo_provider="google", google_maps_api_key="key")
     provider = get_geo_provider(settings)
-    assert isinstance(provider, GoogleGeoProvider)
+    assert isinstance(provider, CachingGeoProvider)
+    assert isinstance(provider._inner, GoogleGeoProvider)
 
 
 @pytest.mark.asyncio
@@ -135,3 +139,62 @@ async def test_reverse_geocode_default_unsupported() -> None:
     result = await provider.reverse_geocode(48.85, 2.35)
     assert result.status == "unresolved"
     assert "not supported" in result.error
+
+
+@pytest.mark.asyncio
+async def test_caching_provider_caches_repeated_queries() -> None:
+    """Repeated queries should hit the cache, not the inner provider."""
+    call_count = 0
+
+    class _CountingProvider(GeoProvider):
+        name = "counting"
+
+        async def geocode(self, query: str) -> GeocodeResult:
+            nonlocal call_count
+            call_count += 1
+            return GeocodeResult(
+                query=query, status="resolved", latitude=1.0, longitude=2.0,
+                provider="counting", confidence=0.8,
+            )
+
+    caching = CachingGeoProvider(_CountingProvider(), min_interval_sec=0.0)
+    r1 = await caching.geocode("Paris")
+    r2 = await caching.geocode("Paris")
+    assert call_count == 1  # second call hit cache
+    assert r1.latitude == r2.latitude
+    assert caching.cache_stats()["entries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_caching_provider_normalizes_query_keys() -> None:
+    """Cache keys should be case-insensitive and whitespace-normalized."""
+    call_count = 0
+
+    class _CountingProvider(GeoProvider):
+        name = "counting"
+
+        async def geocode(self, query: str) -> GeocodeResult:
+            nonlocal call_count
+            call_count += 1
+            return GeocodeResult(query=query, status="unresolved", provider="counting")
+
+    caching = CachingGeoProvider(_CountingProvider(), min_interval_sec=0.0)
+    await caching.geocode("Paris")
+    await caching.geocode("  paris  ")
+    await caching.geocode("PARIS")
+    assert call_count == 1  # all normalized to same key
+
+
+@pytest.mark.asyncio
+async def test_caching_provider_clear_cache() -> None:
+    class _Dummy(GeoProvider):
+        name = "dummy"
+
+        async def geocode(self, query: str) -> GeocodeResult:
+            return GeocodeResult(query=query, status="unresolved", provider="dummy")
+
+    caching = CachingGeoProvider(_Dummy(), min_interval_sec=0.0)
+    await caching.geocode("test")
+    assert caching.cache_stats()["entries"] == 1
+    caching.clear_cache()
+    assert caching.cache_stats()["entries"] == 0

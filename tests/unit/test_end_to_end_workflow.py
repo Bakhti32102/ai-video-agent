@@ -45,10 +45,14 @@ class _MockGeoProvider(GeoProvider):
 
 def _build_mock_client() -> McpClient:
     """Build an MCP client with mocked external dependencies."""
-    # Start from a default registry, then override geo + audio.
+    # Start from a default registry, then override geo + audio + render.
     base_client = McpClient(validate_results=False)
     geo_server = GeoMcpServer(provider=_MockGeoProvider())
     audio_server = AudioMcpServer(ffmpeg_service=StubFFmpegService())
+    # Inject StubFFmpegService into the render server so no real ffmpeg call
+    # is made during the e2e test (keeps tests hermetic and fast).
+    from app.mcp.servers.render.server import RenderMcpServer
+    render_server = RenderMcpServer(ffmpeg_service=StubFFmpegService())
 
     servers: dict = {}
     for name in AgentName:
@@ -58,6 +62,7 @@ def _build_mock_client() -> McpClient:
             servers[name] = base_client._registry.get_server(name)
     servers[AgentName.GEO] = geo_server
     servers[AgentName.AUDIO] = audio_server
+    servers[AgentName.RENDER] = render_server
     return McpClient(servers=servers, validate_results=False)
 
 
@@ -153,3 +158,43 @@ async def test_end_to_end_workflow_locations_have_provenance() -> None:
         if loc.get("status") == "resolved":
             assert loc.get("provenance") is not None
             assert loc["provenance"]["provider"] == "mock"
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_real_video_pipeline() -> None:
+    """Full pipeline with real ffmpeg: script → scenes → text overlays → real MP4 → QA pass.
+
+    This is the Phase 4 deliverable test: produces a real 1920x1080 H.264 MP4
+    and verifies QA passes on it. Uses real ffmpeg (no stub).
+    """
+    import os
+    from app.database import init_db
+    init_db()  # ensure tables exist for DB persistence verification
+    client = McpClient()  # real ffmpeg, real services
+    sup = SupervisorAgent(client, max_retries=1)
+    result = await sup.run_project(
+        project_id="real_video_e2e",
+        script_text=GADSDEN_SCRIPT,
+        total_duration_sec=5.0,
+    )
+    # Pipeline should complete successfully.
+    assert result["failed"] is False
+    assert result["final_state"] == WorkflowStateEnum.COMPLETED.value
+    # Render output should be a real file.
+    render_output = result["results"]["render"]["output"]["output_path"]
+    assert render_output is not None
+    assert os.path.exists(render_output)
+    assert os.path.getsize(render_output) > 1024
+    # QA should pass.
+    assert result["qa_report"]["passed"] is True
+    # Verify DB persistence.
+    from app.services.projects import ProjectService
+    svc = ProjectService()
+    jobs = svc.get_render_jobs("real_video_e2e")
+    assert len(jobs) >= 1
+    reports = svc.get_qa_reports("real_video_e2e")
+    assert len(reports) >= 1
+    assert reports[0].passed is True
+    # Cleanup.
+    if os.path.exists(render_output):
+        os.remove(render_output)

@@ -149,14 +149,18 @@ class QaMcpServer(BaseMcpServer):
 
     async def _validate_render(self, inp: ValidateProjectInput) -> Result[ValidateProjectOutput]:
         findings: list[QAFinding] = []
-        # The render_output_path comes via create_qa_report; for the standalone
-        # validate_render tool, check video_duration presence.
         if inp.video_duration_sec is None:
             findings.append(QAFinding(
                 category=QACategory.RENDER_ERROR,
                 severity=QASeverity.ERROR,
                 message="no video_duration_sec provided; render output may be missing",
             ))
+        # Check render_output_path if provided (via extra fields).
+        render_path = getattr(inp, "render_output_path", None)
+        if render_path:
+            findings.extend(await self._check_render_output(render_path))
+        elif inp.video_duration_sec is not None:
+            findings.extend(await self._check_render_output(None, video_duration_sec=inp.video_duration_sec))
         return self._build_output(inp.project_id, findings)
 
     async def _create_qa_report(self, inp: CreateQaReportInput) -> Result[CreateQaReportOutput]:
@@ -168,7 +172,7 @@ class QaMcpServer(BaseMcpServer):
         findings.extend(self._check_audio(inp.audio_duration_sec, inp.video_duration_sec))
         findings.extend(self._check_assets(scenes))
         findings.extend(self._check_locations(scenes))
-        findings.extend(self._check_render_output(inp.render_output_path))
+        findings.extend(await self._check_render_output(inp.render_output_path, video_duration_sec=inp.video_duration_sec))
 
         passed = not any(f.severity in (QASeverity.ERROR, QASeverity.CRITICAL) for f in findings)
         report = QAReport(
@@ -196,7 +200,23 @@ class QaMcpServer(BaseMcpServer):
         scenes: list[Scene] = []
         for s in scenes_data:
             try:
-                scenes.append(Scene.model_validate(s))
+                # The script server returns rich metadata fields not in the
+                # Scene contract. Extract only the fields Scene needs.
+                scene_kwargs = {
+                    "id": s.get("id", ""),
+                    "project_id": s.get("project_id", ""),
+                    "index": s.get("index", 0),
+                    "title": s.get("title", ""),
+                    "start_time": float(s.get("start_time", 0.0)),
+                    "end_time": float(s.get("end_time", 1.0)),
+                    "narration": s.get("narration"),
+                    "location": s.get("location"),
+                    "assets": s.get("assets", []),
+                    "status": s.get("status", "pending"),
+                }
+                # Remove None values for optional fields.
+                scene_kwargs = {k: v for k, v in scene_kwargs.items() if v is not None}
+                scenes.append(Scene.model_validate(scene_kwargs))
             except Exception:  # noqa: BLE001
                 continue
         return scenes
@@ -298,13 +318,64 @@ class QaMcpServer(BaseMcpServer):
                     ))
         return findings
 
-    def _check_render_output(self, render_output_path: str | None) -> list[QAFinding]:
+    async def _check_render_output(self, render_output_path: str | None, *, video_duration_sec: float | None = None) -> list[QAFinding]:
         findings: list[QAFinding] = []
+        # If a video duration was expected but no render output path is provided,
+        # the render step failed or was skipped.
         if render_output_path is None:
+            if video_duration_sec is not None:
+                findings.append(QAFinding(
+                    category=QACategory.RENDER_ERROR,
+                    severity=QASeverity.CRITICAL,
+                    message="no render output path provided; video was not rendered",
+                ))
+            return findings
+        # Check file existence.
+        import os
+        if not os.path.exists(render_output_path):
             findings.append(QAFinding(
                 category=QACategory.RENDER_ERROR,
                 severity=QASeverity.CRITICAL,
-                message="no render output path provided; video was not rendered",
+                message=f"render output file does not exist: {render_output_path}",
+            ))
+            return findings
+        # Check file size is non-trivial (>1KB).
+        size = os.path.getsize(render_output_path)
+        if size < 1024:
+            findings.append(QAFinding(
+                category=QACategory.RENDER_ERROR,
+                severity=QASeverity.ERROR,
+                message=f"render output file is suspiciously small ({size} bytes): {render_output_path}",
+            ))
+        # Probe the video file for codec/dimension/duration validation.
+        try:
+            from app.services.ffmpeg import get_ffmpeg_service
+            ffmpeg = get_ffmpeg_service()
+            info = await ffmpeg.probe(render_output_path)
+            if info.duration_sec is not None and info.duration_sec < 0.5:
+                findings.append(QAFinding(
+                    category=QACategory.RENDER_ERROR,
+                    severity=QASeverity.ERROR,
+                    message=f"rendered video duration is too short: {info.duration_sec:.2f}s",
+                ))
+            if info.width and info.height:
+                if info.width != 1920 or info.height != 1080:
+                    findings.append(QAFinding(
+                        category=QACategory.RENDER_ERROR,
+                        severity=QASeverity.WARNING,
+                        message=f"rendered video is {info.width}x{info.height}; expected 1920x1080",
+                    ))
+            if info.codec and info.codec not in ("h264", "hevc", "vp9", "av1"):
+                findings.append(QAFinding(
+                    category=QACategory.RENDER_ERROR,
+                    severity=QASeverity.WARNING,
+                    message=f"rendered video codec is {info.codec}; h264 recommended",
+                ))
+        except Exception as exc:  # noqa: BLE001
+            findings.append(QAFinding(
+                category=QACategory.RENDER_ERROR,
+                severity=QASeverity.WARNING,
+                message=f"could not probe render output: {exc}",
             ))
         return findings
 

@@ -46,25 +46,38 @@ class Settings(BaseSettings):
     # --- LLM ---
     llm_provider: LlmProvider = "none"
     llm_model: str = ""
+    llm_api_key: str = ""
     openai_api_key: str = ""
+    gemini_api_key: str = ""
     openrouter_api_key: str = ""
     google_api_key: str = ""
 
     # --- Map / geocoding ---
     geo_provider: GeoProvider = "none"
     google_maps_api_key: str = ""
+    nominatim_url: str = "https://nominatim.openstreetmap.org/search"
     # Legacy aliases kept for backward compatibility with Phase 2 callers.
     map_provider: str = "none"
     map_api_key: str = ""
 
     # --- FFmpeg ---
     ffmpeg_path: str = "ffmpeg"
+    ffprobe_path: str = "ffprobe"
+
+    # --- Video defaults ---
+    video_width: int = 1920
+    video_height: int = 1080
+    video_fps: float = 30.0
+    video_codec: str = "libx264"
+    audio_codec: str = "aac"
 
     # --- Runtime directories ---
     data_dir: str = "./data"
     assets_dir: str = "./assets"
+    sounds_dir: str = "./sounds"
     output_dir: str = "./output"
     logs_dir: str = "./logs"
+    temp_dir: str = "./temp"
 
     @field_validator("database_url")
     @classmethod
@@ -92,6 +105,10 @@ class Settings(BaseSettings):
         return self.resolved_path(self.assets_dir)
 
     @property
+    def sounds_path(self) -> Path:
+        return self.resolved_path(self.sounds_dir)
+
+    @property
     def output_path(self) -> Path:
         return self.resolved_path(self.output_dir)
 
@@ -100,18 +117,26 @@ class Settings(BaseSettings):
         return self.resolved_path(self.logs_dir)
 
     @property
+    def temp_path(self) -> Path:
+        return self.resolved_path(self.temp_dir)
+
+    @property
     def is_production(self) -> bool:
         return self.app_env == "production"
 
     def ensure_runtime_dirs(self) -> None:
-        """Create the runtime data/asset/output/log directories if missing."""
-        for p in (self.data_path, self.assets_path, self.output_path, self.logs_path):
+        """Create the runtime data/asset/output/log/temp directories if missing."""
+        for p in (
+            self.data_path, self.assets_path, self.sounds_path,
+            self.output_path, self.logs_path, self.temp_path,
+        ):
             p.mkdir(parents=True, exist_ok=True)
 
     def api_keys_present(self) -> dict[str, bool]:
         """Report which provider keys are configured (without exposing values)."""
         return {
-            "openai": bool(self.openai_api_key),
+            "openai": bool(self.openai_api_key or self.llm_api_key),
+            "gemini": bool(self.gemini_api_key),
             "openrouter": bool(self.openrouter_api_key),
             "google": bool(self.google_api_key),
             "google_maps": bool(self.google_maps_api_key),

@@ -27,6 +27,8 @@ from app.core.exceptions import AppError, RenderError
 from app.core.logging import get_logger, log_event
 from app.core.result import Result
 from app.mcp.schemas import (
+    ComposeVideoInput,
+    ComposeVideoOutput,
     CreateRenderJobInput,
     CreateRenderJobOutput,
     GetRenderStatusInput,
@@ -37,7 +39,13 @@ from app.mcp.schemas import (
     ValidateRenderJobOutput,
 )
 from app.mcp.servers.base import BaseMcpServer, ToolDefinition
-from app.services.ffmpeg import FFmpegService, RenderJobParams, get_ffmpeg_service
+from app.services.ffmpeg import (
+    ComposeVideoParams,
+    FFmpegService,
+    OverlayLayer,
+    RenderJobParams,
+    get_ffmpeg_service,
+)
 from app.utils.ids import new_id
 
 logger = get_logger("mcp.render")
@@ -47,8 +55,8 @@ class RenderMcpServer(BaseMcpServer):
     """Renders the final video from project/timeline data via FFmpeg."""
 
     name = AgentName.RENDER
-    version = "3.0.0"
-    description = "Creates and executes render jobs via safe FFmpeg subprocess execution."
+    version = "4.0.0"
+    description = "Creates, composes, and executes render jobs via safe FFmpeg subprocess."
 
     def __init__(self, ffmpeg_service: FFmpegService | None = None) -> None:
         super().__init__()
@@ -76,6 +84,14 @@ class RenderMcpServer(BaseMcpServer):
             input_schema=RenderVideoInput,
             output_schema=RenderVideoOutput,
             handler=self._render_video,
+            tags={"write"},
+        ))
+        self._register_tool(ToolDefinition(
+            name="compose_video",
+            description="Compose a video from background + image overlays + audio via FFmpeg filter_complex.",
+            input_schema=ComposeVideoInput,
+            output_schema=ComposeVideoOutput,
+            handler=self._compose_video,
             tags={"write"},
         ))
         self._register_tool(ToolDefinition(
@@ -199,6 +215,78 @@ class RenderMcpServer(BaseMcpServer):
             output_path=job.get("output_path"),
             error=job.get("error"),
         ))
+
+    async def _compose_video(self, inp: ComposeVideoInput) -> Result[ComposeVideoOutput]:
+        """Compose a video from background + overlays + audio via FFmpeg."""
+        job_id = new_id("compose_")
+        warnings: list[str] = []
+        output_filename = inp.output_filename
+        if not output_filename.lower().endswith(f".{inp.format}"):
+            output_filename = f"{output_filename}.{inp.format}"
+
+        # Build overlay layers.
+        overlays: list[OverlayLayer] = []
+        if inp.overlays:
+            for ov in inp.overlays:
+                try:
+                    overlays.append(OverlayLayer(
+                        image_path=ov["image_path"],
+                        x=float(ov.get("x", 0.0)),
+                        y=float(ov.get("y", 0.0)),
+                        start_time=float(ov.get("start_time", 0.0)),
+                        end_time=float(ov["end_time"]) if ov.get("end_time") is not None else None,
+                        opacity=float(ov.get("opacity", 1.0)),
+                    ))
+                except (KeyError, TypeError, ValueError) as exc:
+                    return Result.fail(f"invalid overlay: {exc}")
+
+        bg_color = inp.background_color if inp.background_color.startswith("#") else f"#{inp.background_color}"
+
+        job = {
+            "job_id": job_id,
+            "project_id": inp.project_id,
+            "status": RenderJobStatus.RUNNING.value,
+            "output_path": output_filename,
+            "error": None,
+        }
+        self._jobs[job_id] = job
+        log_event(logger, "compose.started", job_id=job_id, overlays=len(overlays))
+
+        try:
+            params = ComposeVideoParams(
+                output_path=output_filename,
+                width=inp.width,
+                height=inp.height,
+                fps=inp.fps,
+                duration_sec=inp.duration_sec,
+                background_color=bg_color,
+                background_image=inp.background_image,
+                overlays=overlays,
+                audio_path=inp.audio_path,
+                video_filter=inp.video_filter,
+                format=inp.format,
+            )
+            output_path = await self.ffmpeg.compose(params)
+            job["status"] = RenderJobStatus.COMPLETED.value
+            job["output_path"] = output_path
+            log_event(logger, "compose.completed", job_id=job_id, output=output_path)
+            return Result.ok(ComposeVideoOutput(
+                job_id=job_id,
+                status=RenderJobStatus.COMPLETED.value,
+                output_path=output_path,
+                duration_sec=inp.duration_sec,
+                warnings=warnings,
+            ))
+        except (AppError, RenderError) as exc:
+            job["status"] = RenderJobStatus.FAILED.value
+            job["error"] = str(exc)
+            log_event(logger, "compose.failed", job_id=job_id, error=str(exc))
+            return Result.fail(f"compose failed: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = RenderJobStatus.FAILED.value
+            job["error"] = str(exc)
+            log_event(logger, "compose.failed", job_id=job_id, error=str(exc))
+            return Result.fail(f"compose failed unexpectedly: {exc}")
 
     # --- legacy -------------------------------------------------------------
 

@@ -11,11 +11,11 @@ specialized MCP servers. It deliberately **does not** depend on Adobe After
 Effects or GEOlayers 3 and favours open-source / local technologies
 (FFmpeg, GeoJSON, SVG/HTML/Canvas, MapLibre/Leaflet).
 
-> **Status:** Phase 3 — real MCP architecture with 9 specialized servers,
-> provider abstraction, safe FFmpeg rendering, and full supervisor
-> orchestration. The core pipeline is functional. Remaining work (LLM-driven
-> NER, real map-tile rendering, Whisper alignment) is Phase 4+ (see
-> [Current implementation status](#current-implementation-status)).
+> **Status:** Phase 4 — real video pipeline. The system accepts a documentary
+> script + voice-over audio and produces a professional 16:9 documentary-style
+> video (1920x1080 H.264 MP4) via FFmpeg. All 9 MCP servers, supervisor
+> orchestration, DB persistence, QA validation, CLI, REST API, and Streamlit
+> UI are functional. See [Current implementation status](#current-implementation-status).
 
 ---
 
@@ -206,7 +206,7 @@ Key guarantees enforced through the architecture:
 
 ---
 
-## Current implementation status (Phase 3)
+## Current implementation status (Phase 4)
 
 ### Phase 1 — foundation (complete)
 
@@ -280,10 +280,36 @@ Key guarantees enforced through the architecture:
   produces structured data for scenes, narration timing, locations, map
   requirements, text, transitions, sound design, render job, and QA report.
 
-**362 tests** (all passing), 2 skipped (real ffmpeg render, requires ffmpeg
-installed): 265 Phase 1/2 + 97 Phase 3 tests covering the base architecture,
-registry, client, all 9 servers, geo providers, FFmpeg renderer safety, and
-the end-to-end workflow.
+### Phase 4 — real video pipeline (complete)
+
+- **Real video rendering**: `compose_video` in the Render MCP server uses
+  real FFmpeg to produce 1920x1080 @ 30fps H.264 MP4 files. Text overlays are
+  rendered to PNG via Pillow, then composited into the video.
+- **Text overlay rendering**: `render_text` uses Pillow to render documentary
+  captions/titles to transparent PNG overlays with configurable font, size,
+  color, and position.
+- **Map animation engine**: `MapAnimationEngine` generates SVG/PNG map frames
+  with zoom/pan animations from GeoJSON + geocoded coordinates.
+- **QA validation of real video**: the QA server probes rendered MP4s with
+  ffprobe to verify codec (h264), resolution (1920x1080), duration, and file
+  integrity. Flags CRITICAL when render is expected but missing.
+- **DB persistence**: `ProjectService` now persists render jobs, QA reports,
+  and workflow state to the database. The supervisor's `_finalize` method
+  auto-creates project records and saves all outputs.
+- **Guardrails for video output**: new `video_output` guardrail validates
+  resolution, fps, codec, and duration meet documentary standards.
+- **CLI `produce` command**: `python -m app.main produce --script "..." --duration 30`
+  runs the full pipeline from the command line.
+- **REST API `/produce` endpoint**: POST to `/produce` with script text and
+  duration to trigger video production.
+- **Streamlit UI** (`app/ui.py`): interactive web UI for entering scripts,
+  configuring duration, producing videos, and viewing results including the
+  video player and QA findings.
+- **Real video e2e test**: `test_end_to_end_real_video_pipeline` produces a
+  real MP4, verifies QA passes, and confirms DB persistence.
+
+**380 tests** (all passing), covering the full architecture, all 9 servers,
+real FFmpeg rendering, DB persistence, guardrails, CLI, API, and e2e pipeline.
 
 ---
 
@@ -350,19 +376,71 @@ are called during tests (geo uses a mock provider; render uses the stub).
 
 ---
 
-## What is NOT implemented yet (Phase 4+)
+## What is NOT implemented yet (Phase 5+)
 
 - LLM-driven script understanding and NER (current: heuristic detection).
-- Real map-tile rendering via MapLibre/Leaflet (current: spec only).
+- Real map-tile rendering via MapLibre/Leaflet (current: SVG/PNG spec).
 - Whisper/forced-alignment for audio transcription.
 - Real icon/asset generation from external sources.
-- Full timeline persistence to the database.
 - A real MCP network transport (stdio/SSE).
-- **Streamlit UI** (deliberately deferred).
 
 **After Effects and GEOlayers 3 are NOT required** by the core architecture.
 The pipeline uses FFmpeg for rendering. An optional After Effects/GEOlayers
 adapter may be added in the future.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.12+
+- FFmpeg (with libx264, libfreetype)
+- Pillow (for text rendering)
+
+### Install
+
+```bash
+pip install -r requirements.txt
+```
+
+### Initialize the database
+
+```bash
+python -m app.main init-db
+```
+
+### Produce a video (CLI)
+
+```bash
+python -m app.main produce \
+  --script "The Gadsden Purchase of 1853 was a landmark treaty between the United States and Mexico." \
+  --duration 30
+```
+
+### Produce a video (REST API)
+
+```bash
+# Start the server
+python -m app.main serve
+
+# POST to /produce
+curl -X POST http://localhost:8000/produce \
+  -H "Content-Type: application/json" \
+  -d '{"script_text": "The Gadsden Purchase of 1853...", "total_duration_sec": 30}'
+```
+
+### Produce a video (Streamlit UI)
+
+```bash
+streamlit run app/ui.py
+```
+
+### Run tests
+
+```bash
+python -m pytest -q
+```
 
 ---
 

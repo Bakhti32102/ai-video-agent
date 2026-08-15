@@ -120,6 +120,33 @@ class Guardrails:
                 )
         return Result.ok(report)
 
+    def video_output(
+        self,
+        *,
+        width: int = 1920,
+        height: int = 1080,
+        fps: float = 30.0,
+        codec: str = "h264",
+        duration_sec: float | None = None,
+    ) -> Result[dict[str, Any]]:
+        """Validate video output parameters meet documentary standards."""
+        errors: list[str] = []
+        if width < 1280 or height < 720:
+            errors.append(f"video resolution {width}x{height} is below minimum 1280x720")
+        if width != 1920 or height != 1080:
+            errors.append(f"video resolution {width}x{height}; expected 1920x1080 for 16:9 documentary")
+        if fps < 24.0 or fps > 60.0:
+            errors.append(f"fps {fps} is outside acceptable range 24-60")
+        if codec not in ("h264", "hevc", "vp9", "av1"):
+            errors.append(f"codec {codec} is not a recommended video codec (h264/hevc/vp9/av1)")
+        if duration_sec is not None and duration_sec < 1.0:
+            errors.append(f"video duration {duration_sec}s is too short (minimum 1.0s)")
+        if errors:
+            return Result.fail(*errors)
+        return Result.ok({
+            "width": width, "height": height, "fps": fps, "codec": codec, "duration_sec": duration_sec,
+        })
+
     def agent_result(self, result: AgentResult) -> Result[AgentResult]:
         """Validate a full AgentResult, including provenance when present."""
         errors: list[str] = []

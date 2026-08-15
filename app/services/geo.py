@@ -10,6 +10,10 @@ Provider implementations:
 - :class:`OpenStreetMapGeoProvider` — free Nominatim API (no key required).
 - :class:`GoogleGeoProvider` — Google Maps Geocoding API (key required).
 
+Caching and rate limiting are provided by :class:`CachingGeoProvider`, which
+wraps any provider so repeated queries do not hit external APIs and the
+Nominatim usage policy (max 1 request/second) is honoured.
+
 Both make HTTP requests only when explicitly invoked. Tests inject mock
 providers so no paid API is ever called during testing.
 """
@@ -17,6 +21,7 @@ providers so no paid API is ever called during testing.
 from __future__ import annotations
 
 import json
+import time
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
@@ -124,15 +129,22 @@ class OpenStreetMapGeoProvider(GeoProvider):
     """OpenStreetMap Nominatim geocoder (free, no API key required).
 
     Uses the public Nominatim API. Honours the usage policy by making a single
-    request per call. Results include full provenance.
+    request per call and respecting a minimum interval between requests.
+    Results include full provenance.
     """
 
     name = "osm"
-    NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
-    def __init__(self, settings: Settings | None = None, *, user_agent: str = "ai-video-agent") -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        user_agent: str = "ai-video-agent",
+        nominatim_url: str | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
         self.user_agent = user_agent
+        self.nominatim_url = nominatim_url or self.settings.nominatim_url
 
     @property
     def is_configured(self) -> bool:
@@ -143,7 +155,7 @@ class OpenStreetMapGeoProvider(GeoProvider):
             return GeocodeResult(query=query, status="unresolved", provider=self.name, error="empty query")
 
         params = urllib.parse.urlencode({"q": query.strip(), "format": "jsonv2", "limit": 1})
-        url = f"{self.NOMINATIM_URL}?{params}"
+        url = f"{self.nominatim_url}?{params}"
         try:
             raw_responses = self._http_get_json(url)
         except Exception as exc:  # noqa: BLE001
@@ -168,7 +180,7 @@ class OpenStreetMapGeoProvider(GeoProvider):
 
         provenance = GeoProvenance(
             provider=self.name,
-            source=self.NOMINATIM_URL,
+            source=self.nominatim_url,
             query=query,
             latitude=lat,
             longitude=lon,
@@ -277,6 +289,74 @@ class GoogleGeoProvider(GeoProvider):
             return json.loads(resp.read().decode("utf-8"))
 
 
+class CachingGeoProvider(GeoProvider):
+    """Wrapper that adds an in-memory cache and rate limiting to any provider.
+
+    - Repeated queries with the same normalized text return the cached result
+      instantly (no external API call).
+    - A minimum interval between requests is enforced (default 1.0s, matching
+      the Nominatim usage policy). Rate limiting only applies to actual
+      provider calls; cache hits are not rate-limited.
+    """
+
+    name = "cache"
+
+    def __init__(
+        self,
+        inner: GeoProvider,
+        *,
+        min_interval_sec: float = 1.0,
+        cache_ttl_sec: float | None = None,
+    ) -> None:
+        self._inner = inner
+        self._min_interval = max(0.0, min_interval_sec)
+        self._cache_ttl = cache_ttl_sec
+        self._cache: dict[str, tuple[GeocodeResult, float]] = {}
+        self._last_request_time: float = 0.0
+
+    @property
+    def is_configured(self) -> bool:
+        return self._inner.is_configured
+
+    async def geocode(self, query: str) -> GeocodeResult:
+        key = self._cache_key(query)
+        now = time.monotonic()
+        # Cache hit?
+        if key in self._cache:
+            cached_result, cached_at = self._cache[key]
+            if self._cache_ttl is None or (now - cached_at) < self._cache_ttl:
+                logger.debug("geocode cache hit: %s", query)
+                return cached_result
+        # Rate limit: sleep if we made a request too recently.
+        elapsed = now - self._last_request_time
+        if elapsed < self._min_interval:
+            delay = self._min_interval - elapsed
+            logger.debug("rate limiting: sleeping %.2fs before next geocode", delay)
+            time.sleep(delay)
+        self._last_request_time = time.monotonic()
+        result = await self._inner.geocode(query)
+        # Cache all results (resolved or unresolved) so we don't re-query.
+        self._cache[key] = (result, time.monotonic())
+        return result
+
+    async def reverse_geocode(self, latitude: float, longitude: float) -> GeocodeResult:
+        return await self._inner.reverse_geocode(latitude, longitude)
+
+    def cache_stats(self) -> dict[str, Any]:
+        return {
+            "entries": len(self._cache),
+            "min_interval_sec": self._min_interval,
+            "ttl_sec": self._cache_ttl,
+        }
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+
+    @staticmethod
+    def _cache_key(query: str) -> str:
+        return query.strip().lower()
+
+
 def get_geo_provider(settings: Settings | None = None) -> GeoProvider:
     """Factory: return the configured geo provider.
 
@@ -284,17 +364,22 @@ def get_geo_provider(settings: Settings | None = None) -> GeoProvider:
     1. ``GEO_PROVIDER=google`` with ``GOOGLE_MAPS_API_KEY`` -> GoogleGeoProvider
     2. ``GEO_PROVIDER=osm`` -> OpenStreetMapGeoProvider (free, no key)
     3. ``GEO_PROVIDER=none`` (or unset) -> NoneGeoProvider (always unresolved)
+
+    OSM and Google providers are wrapped in :class:`CachingGeoProvider` to
+    honour rate limits and avoid redundant API calls.
     """
     settings = settings or get_settings()
     provider = settings.geo_provider
     if provider == "google":
-        return GoogleGeoProvider(settings)
+        return CachingGeoProvider(GoogleGeoProvider(settings), min_interval_sec=0.2)
     if provider == "osm":
-        return OpenStreetMapGeoProvider(settings)
+        # Nominatim usage policy: max 1 request/second.
+        return CachingGeoProvider(OpenStreetMapGeoProvider(settings), min_interval_sec=1.0)
     return NoneGeoProvider()
 
 
 __all__ = [
+    "CachingGeoProvider",
     "GeocodeResult",
     "GeoProvider",
     "GoogleGeoProvider",

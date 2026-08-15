@@ -114,10 +114,27 @@ async def test_audio_create_audio_timeline() -> None:
 
 @pytest.mark.asyncio
 async def test_audio_detect_silence() -> None:
-    server = AudioMcpServer()
+    # Use a stub ffmpeg service so no real ffmpeg call is made.
+    from app.services.ffmpeg import StubFFmpegService
+    server = AudioMcpServer(ffmpeg_service=StubFFmpegService())
     result = await server.execute_tool("detect_silence", {"file_path": "/tmp/test.wav"})
     assert result.success
     assert "silence_segments" in result.data
+
+
+@pytest.mark.asyncio
+async def test_audio_silence_log_parsing() -> None:
+    """Verify the ffmpeg silencedetect log parser works correctly."""
+    from app.mcp.servers.audio.server import AudioMcpServer
+    log = (
+        "[silencedetect @ 0x123] silence_start: 1.2300\n"
+        "[silencedetect @ 0x123] silence_end: 2.4500 | silence_duration: 1.2200\n"
+    )
+    segs = AudioMcpServer._parse_silence_log(log)
+    assert len(segs) == 1
+    assert segs[0]["start_time"] == 1.23
+    assert segs[0]["end_time"] == 2.45
+    assert segs[0]["duration_sec"] == 1.22
 
 
 # === Geo MCP ===
@@ -441,6 +458,22 @@ async def test_qa_create_report_no_render() -> None:
         "scenes": [{"id": "s1", "project_id": "p1", "index": 0, "title": "A", "start_time": 0.0, "end_time": 5.0, "narration": "n"}],
     })
     assert result.success
+    # No render_output_path means QA runs pre-render; no render_error finding.
+    assert result.data["passed"] is True
+    cats = [f["category"] for f in result.data["findings"]]
+    assert "render_error" not in cats
+
+
+@pytest.mark.asyncio
+async def test_qa_create_report_missing_render_file() -> None:
+    server = QaMcpServer()
+    result = await server.execute_tool("create_qa_report", {
+        "project_id": "p1",
+        "scenes": [{"id": "s1", "project_id": "p1", "index": 0, "title": "A", "start_time": 0.0, "end_time": 5.0, "narration": "n"}],
+        "render_output_path": "output/nonexistent.mp4",
+    })
+    assert result.success
     assert result.data["passed"] is False
     cats = [f["category"] for f in result.data["findings"]]
     assert "render_error" in cats
+

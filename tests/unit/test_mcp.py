@@ -99,6 +99,14 @@ async def test_render_server_refuses_in_phase1(mcp_client) -> None:
 
 @pytest.mark.asyncio
 async def test_qa_server_runs_structural_checks(mcp_client) -> None:
+    # Create a dummy render output so the render check passes.
+    import os
+    from app.config import get_settings
+    settings = get_settings()
+    render_path = os.path.join(settings.output_path, "gadsden_test.mp4")
+    os.makedirs(os.path.dirname(render_path), exist_ok=True)
+    with open(render_path, "wb") as f:
+        f.write(b"\0" * 2048)  # >1KB so size check passes; ffprobe warning is OK
     result = await mcp_client.call(
         AgentName.QA,
         "run_qa",
@@ -111,7 +119,7 @@ async def test_qa_server_runs_structural_checks(mcp_client) -> None:
             "timeline_events": [],
             "audio_duration_sec": 10.0,
             "video_duration_sec": 10.0,
-            "render_output_path": "output/test.mp4",
+            "render_output_path": render_path,
         },
     )
     assert result.success
@@ -133,7 +141,6 @@ async def test_qa_server_detects_audio_video_mismatch(mcp_client) -> None:
             "timeline_events": [],
             "audio_duration_sec": 10.0,
             "video_duration_sec": 12.0,
-            "render_output_path": "output/test.mp4",
         },
     )
     assert result.success

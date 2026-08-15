@@ -250,27 +250,55 @@ class SupervisorAgent:
         context["resolved_locations"] = geo_results
         state = self._advance_state(state, WorkflowStateEnum.GENERATING_MAPS)
 
+        # Step 4b: Build map plans for resolved locations.
+        map_images: list[dict[str, Any]] = []
+        for loc in geo_results:
+            lat = loc.get("latitude")
+            lon = loc.get("longitude")
+            name = loc.get("name", "location")
+            if lat is not None and lon is not None:
+                map_result = await self.run_agent(
+                    AgentName.GEO, "build_map_plan",
+                    {"location_name": name, "latitude": lat, "longitude": lon, "zoom": 5.0, "width": 1920, "height": 1080},
+                )
+                if map_result.success and map_result.output:
+                    map_images.append(map_result.output.get("plan", {}))
+        context["map_images"] = map_images
+
         # Step 5: Assets MCP — list assets (none registered yet in mock).
         assets_result = await self.run_agent(AgentName.ASSET, "list_assets", {})
         results["assets"] = assets_result
         state = self._advance_state(state, WorkflowStateEnum.GENERATING_ASSETS)
 
-        # Step 6: Text MCP — create text overlays per scene.
+        # Step 6: Text MCP — create text overlays per scene + render to PNG.
         text_overlays: list[dict[str, Any]] = []
         for scene in context["scenes"]:
             scene_id = scene.get("id", new_id("scene_"))
+            title = scene.get("title", f"Scene {scene.get('index', 0)}")
             text_result = await self.run_agent(
                 AgentName.TEXT, "create_text_overlay",
                 {
                     "scene_id": scene_id,
                     "kind": "title",
-                    "text": scene.get("title", f"Scene {scene.get('index', 0)}"),
+                    "text": title,
                     "start_time": scene.get("start_time", 0.0),
                     "end_time": scene.get("end_time", 5.0),
                 },
             )
             if text_result.success and text_result.output:
                 text_overlays.append(text_result.output.get("overlay", {}))
+        # Render each text overlay to a PNG image (real Pillow rendering).
+        for overlay in text_overlays:
+            render_text_result = await self.run_agent(
+                AgentName.TEXT, "render_text",
+                {
+                    "text": overlay.get("text", ""),
+                    "output_path": f"text_{overlay.get('scene_id', 'scene')}.png",
+                    "font_size": 72,
+                },
+            )
+            if render_text_result.success and render_text_result.output:
+                overlay["rendered_path"] = render_text_result.output.get("output_path")
         results["text"] = AgentResult(
             agent=AgentName.TEXT,
             status="success",
@@ -321,27 +349,55 @@ class SupervisorAgent:
             context["sound_events"] = sound_result.output.get("events", [])
         state = self._advance_state(state, WorkflowStateEnum.GENERATING_SOUND)
 
-        # Step 9: Render MCP — create + execute render job.
-        render_job_result = await self.run_agent(
-            AgentName.RENDER, "create_render_job",
-            {
-                "project_id": project_id,
-                "output_filename": f"{project_id}.mp4",
-                "duration_sec": context["audio_duration_sec"] or total_duration_sec,
-            },
-        )
-        results["render_create"] = render_job_result
+        # Step 9: Render MCP — compose the final video with overlays.
+        # Build overlay list from text overlays (rendered PNGs).
+        compose_overlays: list[dict[str, Any]] = []
+        for overlay in text_overlays:
+            rendered_path = overlay.get("rendered_path")
+            if rendered_path:
+                compose_overlays.append({
+                    "image_path": rendered_path,
+                    "x": 0.1,
+                    "y": 0.05,
+                    "start_time": overlay.get("start_time", 0.0),
+                    "end_time": overlay.get("end_time", 5.0),
+                })
+        duration = context["audio_duration_sec"] or total_duration_sec
+        compose_args: dict[str, Any] = {
+            "project_id": project_id,
+            "output_filename": f"{project_id}.mp4",
+            "duration_sec": duration,
+            "width": 1920,
+            "height": 1080,
+            "fps": 30.0,
+            "background_color": "#1a1a2e",
+            "overlays": compose_overlays,
+        }
+        if voiceover_path:
+            compose_args["audio_path"] = voiceover_path
+        compose_result = await self.run_agent(AgentName.RENDER, "compose_video", compose_args)
+        results["render"] = compose_result
         render_output_path = None
-        if render_job_result.success and render_job_result.output:
-            job_id = render_job_result.output.get("job_id")
-            render_result = await self.run_agent(AgentName.RENDER, "render_video", {"job_id": job_id})
-            results["render"] = render_result
-            if render_result.success and render_result.output:
-                render_output_path = render_result.output.get("output_path")
-            elif not render_result.success:
-                # Render failed — but in test/mock environments, this is expected.
-                # We continue to QA so the report captures the missing render.
-                render_output_path = None
+        if compose_result.success and compose_result.output:
+            render_output_path = compose_result.output.get("output_path")
+        elif not compose_result.success:
+            # Compose failed (e.g., StubFFmpegService in test env). Fall back
+            # to the basic render_video tool so the workflow can still produce
+            # a video in environments with ffmpeg but without compose support.
+            fallback_result = await self.run_agent(
+                AgentName.RENDER, "create_render_job",
+                {
+                    "project_id": project_id,
+                    "output_filename": f"{project_id}_fallback.mp4",
+                    "duration_sec": duration,
+                },
+            )
+            if fallback_result.success and fallback_result.output:
+                job_id = fallback_result.output.get("job_id")
+                render_result = await self.run_agent(AgentName.RENDER, "render_video", {"job_id": job_id})
+                results["render_fallback"] = render_result
+                if render_result.success and render_result.output:
+                    render_output_path = render_result.output.get("output_path")
         state = self._advance_state(state, WorkflowStateEnum.RENDERING)
 
         # Step 10: QA MCP — create QA report.
@@ -412,7 +468,49 @@ class SupervisorAgent:
     def _finalize(
         self, state: WorkflowState, results: dict[str, AgentResult], context: dict[str, Any], *, failed: bool
     ) -> dict[str, Any]:
-        """Build the final workflow result dict."""
+        """Build the final workflow result dict and persist to the database."""
+        # Persist workflow state, render job, and QA report to the DB.
+        # Best-effort: DB errors do not fail the workflow result.
+        try:
+            from app.services.projects import ProjectService
+            svc = ProjectService()
+            project_id = context.get("project_id") or "unknown"
+            # Ensure the project row exists (FK target for all child tables).
+            if svc.get_project(project_id) is None:
+                svc.create_project(
+                    name=project_id,
+                    script_text=context.get("script_text"),
+                    project_id=project_id,
+                )
+            svc.save_workflow_state(
+                project_id,
+                current_state=state.current_state.value,
+                previous_state=state.previous_state.value if state.previous_state else None,
+                current_phase=state.current_phase.value if state.current_phase else None,
+                agent_statuses={k: v.status for k, v in results.items()},
+                retries={k: v.attempt - 1 for k, v in results.items()},
+            )
+            render_result = results.get("render")
+            if render_result and render_result.success and render_result.output:
+                output_path = render_result.output.get("output_path")
+                if output_path:
+                    svc.save_render_job(
+                        project_id,
+                        output_path=output_path,
+                        status="completed",
+                        duration_sec=context.get("audio_duration_sec"),
+                    )
+            qa_result = results.get("qa")
+            if qa_result and qa_result.success and qa_result.output:
+                svc.save_qa_report(
+                    project_id,
+                    passed=qa_result.output.get("passed", False),
+                    findings=qa_result.output.get("findings", []),
+                    summary=qa_result.output.get("summary", ""),
+                )
+        except Exception:  # noqa: BLE001
+            # DB persistence is best-effort; never fail the workflow due to DB.
+            pass
         return {
             "project_id": context.get("project_id"),
             "workflow_state": state.model_dump(mode="json"),

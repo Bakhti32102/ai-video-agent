@@ -56,6 +56,59 @@ def cmd_serve(host: str | None = None, port: int | None = None) -> int:
     return 0
 
 
+def cmd_produce(argv: list[str]) -> int:
+    """Run the full video production pipeline on a script.
+
+    Usage:
+        python -m app.main produce --script "The Gadsden Purchase..." [--duration 30]
+                                   [--voiceover path/to/audio.mp3]
+                                   [--project-id my_project]
+    """
+    import argparse
+    import asyncio
+    import json
+
+    parser = argparse.ArgumentParser(prog="app.main produce", description="Produce a documentary video")
+    parser.add_argument("--script", required=True, help="Documentary script text")
+    parser.add_argument("--duration", type=float, default=30.0, help="Target video duration in seconds")
+    parser.add_argument("--voiceover", default=None, help="Path to voiceover audio file")
+    parser.add_argument("--project-id", default=None, help="Project identifier (auto-generated if omitted)")
+    args = parser.parse_args(argv)
+
+    settings = get_settings()
+    settings.ensure_runtime_dirs()
+    init_db(settings)
+
+    from app.agents.supervisor import SupervisorAgent
+    from app.utils.ids import new_id
+
+    project_id = args.project_id or new_id("proj_")
+
+    async def _run() -> dict:
+        client = McpClient()
+        sup = SupervisorAgent(client)
+        return await sup.run_project(
+            project_id=project_id,
+            script_text=args.script,
+            voiceover_path=args.voiceover,
+            total_duration_sec=args.duration,
+        )
+
+    result = asyncio.run(_run())
+    # Print summary to stdout.
+    print(json.dumps({
+        "project_id": result["project_id"],
+        "final_state": result["final_state"],
+        "failed": result["failed"],
+        "scenes": len(result["scenes"]),
+        "text_overlays": len(result.get("text_overlays", [])),
+        "transitions": len(result.get("transitions", [])),
+        "render_output": result.get("results", {}).get("render", {}).get("output", {}).get("output_path"),
+        "qa_passed": result.get("qa_report", {}).get("passed"),
+    }, indent=2))
+    return 0 if not result["failed"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
     reset_engine()  # start clean
@@ -65,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_init_db()
     if argv[0] == "check":
         return cmd_check()
+    if argv[0] == "produce":
+        return cmd_produce(argv[1:])
     logger.error("unknown command: %s", argv[0])
     print(__doc__)
     return 2

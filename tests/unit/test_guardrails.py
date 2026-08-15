@@ -254,3 +254,33 @@ def test_guardrails_qa_report_passed_with_errors_rejected() -> None:
         findings=[QAFinding(category=QACategory.TIMING, severity=QASeverity.ERROR, message="bad")],
     )
     assert g.qa_report(rep).is_failure
+
+
+def test_guardrails_video_output_valid():
+    from app.guardrails import Guardrails
+    g = Guardrails()
+    r = g.video_output(width=1920, height=1080, fps=30.0, codec="h264", duration_sec=10.0)
+    assert not r.is_failure
+
+
+def test_guardrails_video_output_rejects_low_resolution():
+    from app.guardrails import Guardrails
+    g = Guardrails()
+    r = g.video_output(width=640, height=480, fps=30.0, codec="h264")
+    assert r.is_failure
+    assert "1280x720" in r.errors[0]
+
+
+def test_guardrails_video_output_rejects_bad_codec():
+    from app.guardrails import Guardrails
+    g = Guardrails()
+    r = g.video_output(width=1920, height=1080, fps=30.0, codec="mpeg2")
+    assert r.is_failure
+
+
+def test_guardrails_video_output_rejects_short_duration():
+    from app.guardrails import Guardrails
+    g = Guardrails()
+    r = g.video_output(width=1920, height=1080, fps=30.0, codec="h264", duration_sec=0.5)
+    assert r.is_failure
+
