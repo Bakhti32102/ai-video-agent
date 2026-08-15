@@ -12,8 +12,10 @@ from app.models.types import json_column, text_column
 class QAReport(Base, IDMixin, TimestampMixin):
     __tablename__ = "qa_reports"
 
-    project_id: Mapped[str] = mapped_column(String(64), ForeignKey("projects.id"), nullable=False, index=True)
-    status: Mapped[str] = mapped_column(String(64), nullable=False, default="pending")
+    project_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(64), nullable=False, default="pending", index=True)
     passed: Mapped[bool] = mapped_column(default=False)
     summary: Mapped[str | None] = text_column(nullable=True)
     findings: Mapped[dict | None] = json_column()

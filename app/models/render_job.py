@@ -12,8 +12,10 @@ from app.models.types import json_column, text_column
 class RenderJob(Base, IDMixin, TimestampMixin):
     __tablename__ = "render_jobs"
 
-    project_id: Mapped[str] = mapped_column(String(64), ForeignKey("projects.id"), nullable=False, index=True)
-    status: Mapped[str] = mapped_column(String(64), nullable=False, default="queued")
+    project_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(64), nullable=False, default="queued", index=True)
     output_path: Mapped[str | None] = text_column(nullable=True)
     format: Mapped[str] = mapped_column(String(16), nullable=False, default="mp4")
     width: Mapped[int] = mapped_column(Integer, default=1920)

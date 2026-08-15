@@ -18,6 +18,7 @@ from app.schemas.contracts import (
     Asset,
     Location,
     Project,
+    Provenance,
     QAReport,
     Scene,
     TimelineEvent,
@@ -32,6 +33,12 @@ class Guardrails:
 
     def file_path(self, path: str, *, must_exist: bool = False) -> Result[str]:
         return rules.check_file_path(path, must_exist=must_exist)
+
+    def file_path_safe(self, path: str, *, base_dir: str | None = None, must_exist: bool = False) -> Result[str]:
+        return rules.check_file_path_safe(path, base_dir=base_dir, must_exist=must_exist)
+
+    def path_traversal(self, path: str) -> Result[str]:
+        return rules.check_path_traversal(path)
 
     def supported_media(self, path: str, allowed: frozenset[str] | None = None) -> Result[str]:
         return rules.check_supported_media(path, allowed)
@@ -65,6 +72,18 @@ class Guardrails:
 
     def agent_output(self, model_cls: type[BaseModel], payload: Any) -> Result[BaseModel]:
         return rules.check_agent_output(model_cls, payload)
+
+    def id(self, value: str | None, *, field: str = "id") -> Result[str]:
+        return rules.check_id(value, field=field)
+
+    def workflow_transition(self, current: str, target: str) -> Result[str]:
+        return rules.check_workflow_transition(current, target)
+
+    def agent_status(self, status: str) -> Result[str]:
+        return rules.check_agent_status(status)
+
+    def provenance(self, provenance: Any) -> Result[Any]:
+        return rules.check_provenance(provenance)
 
     def project(self, project: Project) -> Result[Project]:
         """Run cross-entity checks for a full project."""
@@ -102,7 +121,25 @@ class Guardrails:
         return Result.ok(report)
 
     def agent_result(self, result: AgentResult) -> Result[AgentResult]:
-        # Pydantic model_validator already enforces success/errors consistency.
+        """Validate a full AgentResult, including provenance when present."""
+        errors: list[str] = []
+        r = self.agent_status(result.status.value)
+        if r.is_failure:
+            errors.extend(r.errors)
+        if result.project_id is not None:
+            r = self.id(result.project_id, field="project_id")
+            if r.is_failure:
+                errors.extend(r.errors)
+        if result.scene_id is not None:
+            r = self.id(result.scene_id, field="scene_id")
+            if r.is_failure:
+                errors.extend(r.errors)
+        if result.provenance is not None:
+            r = self.provenance(result.provenance)
+            if r.is_failure:
+                errors.extend(r.errors)
+        if errors:
+            return Result.fail(*errors)
         return Result.ok(result)
 
 

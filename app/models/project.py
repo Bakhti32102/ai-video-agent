@@ -6,14 +6,14 @@ from sqlalchemy import Float, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, IDMixin, TimestampMixin
-from app.models.types import json_column, str_column, text_column
+from app.models.types import json_column, text_column
 
 
 class Project(Base, IDMixin, TimestampMixin):
     __tablename__ = "projects"
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    status: Mapped[str] = str_column(64, nullable=False)
+    status: Mapped[str] = mapped_column(String(64), nullable=False, default="created", index=True)
     script_text: Mapped[str | None] = text_column(nullable=True)
     voiceover_path: Mapped[str | None] = text_column(nullable=True)
     target_duration_sec: Mapped[float | None] = mapped_column(Float, nullable=True)

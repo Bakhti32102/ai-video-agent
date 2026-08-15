@@ -12,9 +12,11 @@ from app.models.types import json_column, text_column
 class AudioFile(Base, IDMixin, TimestampMixin):
     __tablename__ = "audio_files"
 
-    project_id: Mapped[str] = mapped_column(String(64), ForeignKey("projects.id"), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     file_path: Mapped[str] = mapped_column(String(512), nullable=False)
-    audio_type: Mapped[str] = mapped_column(String(64), nullable=False, default="voiceover")
+    audio_type: Mapped[str] = mapped_column(String(64), nullable=False, default="voiceover", index=True)
     format: Mapped[str] = mapped_column(String(16), nullable=False)
     duration_sec: Mapped[float] = mapped_column(Float, nullable=False)
     sample_rate: Mapped[int | None] = mapped_column(nullable=True)

@@ -52,9 +52,12 @@ def test_scene_persistence(fresh_db) -> None:
 def test_session_scope_rolls_back_on_error(fresh_db) -> None:
     from app.core.exceptions import DatabaseError
     from app.database import session_scope
-    from app.models import Project as ProjectModel
+    from app.models import Scene as SceneModel
 
+    # FK violation: scene references a non-existent project.
     with pytest.raises(DatabaseError):
         with session_scope() as session:
-            session.add(ProjectModel(id="x", name="bad"))  # missing required status
+            session.add(
+                SceneModel(id="scene_bad", project_id="nonexistent", index=0, title="bad", start_time=0.0, end_time=1.0)
+            )
             session.flush()  # type: ignore[attr-defined]
