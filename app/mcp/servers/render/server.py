@@ -1,7 +1,21 @@
-"""Render MCP server (Phase 1 stub).
+"""Render MCP server.
 
-Final video rendering is explicitly a Phase 2+ deliverable. This stub enforces
-the render-job contract and refuses to render until FFmpeg integration lands.
+Manages video render jobs via the :class:`~app.services.ffmpeg.FFmpegRenderer`.
+Security:
+- Safe subprocess execution (no ``shell=True``).
+- Input paths validated against traversal.
+- Output path restricted to the project output directory.
+- Render status tracked in-memory (persistable to DB in future).
+
+Tools:
+- ``create_render_job`` — create and queue a render job
+- ``validate_render_job`` — validate job params before rendering
+- ``render_video`` — execute the render
+- ``get_render_status`` — query job status
+
+Legacy tools (backward compat):
+- ``render_video`` — now uses the new schema (requires job_id)
+- ``probe_media`` — probes media via ffprobe
 """
 
 from __future__ import annotations
@@ -9,39 +23,203 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.enums import AgentName, RenderJobStatus
+from app.core.exceptions import AppError, RenderError
+from app.core.logging import get_logger, log_event
 from app.core.result import Result
-from app.mcp.servers.base import BaseMcpServer
+from app.mcp.schemas import (
+    CreateRenderJobInput,
+    CreateRenderJobOutput,
+    GetRenderStatusInput,
+    GetRenderStatusOutput,
+    RenderVideoInput,
+    RenderVideoOutput,
+    ValidateRenderJobInput,
+    ValidateRenderJobOutput,
+)
+from app.mcp.servers.base import BaseMcpServer, ToolDefinition
+from app.services.ffmpeg import FFmpegService, RenderJobParams, get_ffmpeg_service
+from app.utils.ids import new_id
+
+logger = get_logger("mcp.render")
 
 
 class RenderMcpServer(BaseMcpServer):
     """Renders the final video from project/timeline data via FFmpeg."""
 
     name = AgentName.RENDER
+    version = "3.0.0"
+    description = "Creates and executes render jobs via safe FFmpeg subprocess execution."
 
-    def list_tools(self) -> list[str]:
-        return ["render_video", "probe_media"]
+    def __init__(self, ffmpeg_service: FFmpegService | None = None) -> None:
+        super().__init__()
+        self.ffmpeg = ffmpeg_service or get_ffmpeg_service()
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._register_tool(ToolDefinition(
+            name="create_render_job",
+            description="Create and queue a render job with validated output path.",
+            input_schema=CreateRenderJobInput,
+            output_schema=CreateRenderJobOutput,
+            handler=self._create_render_job,
+            tags={"write"},
+        ))
+        self._register_tool(ToolDefinition(
+            name="validate_render_job",
+            description="Validate render job parameters (paths, dimensions, fps).",
+            input_schema=ValidateRenderJobInput,
+            output_schema=ValidateRenderJobOutput,
+            handler=self._validate_render_job,
+            tags={"read"},
+        ))
+        self._register_tool(ToolDefinition(
+            name="render_video",
+            description="Execute a queued render job via FFmpeg.",
+            input_schema=RenderVideoInput,
+            output_schema=RenderVideoOutput,
+            handler=self._render_video,
+            tags={"write"},
+        ))
+        self._register_tool(ToolDefinition(
+            name="get_render_status",
+            description="Query the status of a render job.",
+            input_schema=GetRenderStatusInput,
+            output_schema=GetRenderStatusOutput,
+            handler=self._get_render_status,
+            tags={"read"},
+        ))
 
     async def handle(self, tool: str, arguments: dict[str, Any]) -> Result[Any]:
-        if tool == "render_video":
-            return await self.render_video(arguments)
         if tool == "probe_media":
-            return await self.probe_media(arguments)
-        return self._fail(f"unknown tool '{tool}' for Render MCP server")
+            return await self._probe_media(arguments)
+        return await self.execute_tool(tool, arguments)
 
-    async def render_video(self, arguments: dict[str, Any]) -> Result[dict]:
-        project_id = arguments.get("project_id")
-        if not project_id:
-            return self._fail("project_id is required")
-        # TODO(Phase 2): build an FFmpeg filtergraph from timeline events and
-        # render a 16:9 MP4. Until then, refuse to produce a fake video.
-        return self._fail(
-            f"video rendering is not implemented in Phase 1 for project {project_id}; "
-            "FFmpeg rendering pipeline is Phase 2"
-        )
+    # --- tool handlers ------------------------------------------------------
 
-    async def probe_media(self, arguments: dict[str, Any]) -> Result[dict]:
+    async def _create_render_job(self, inp: CreateRenderJobInput) -> Result[CreateRenderJobOutput]:
+        job_id = new_id("render_")
+        # Build the output path relative to the output directory.
+        output_path = inp.output_filename
+        # Ensure it has the right extension.
+        if not output_path.lower().endswith(f".{inp.format}"):
+            output_path = f"{output_path}.{inp.format}"
+
+        params = {
+            "project_id": inp.project_id,
+            "output_filename": output_path,
+            "width": inp.width,
+            "height": inp.height,
+            "fps": inp.fps,
+            "duration_sec": inp.duration_sec,
+            "audio_path": inp.audio_path,
+            "format": inp.format,
+        }
+        job = {
+            "job_id": job_id,
+            "project_id": inp.project_id,
+            "status": RenderJobStatus.QUEUED.value,
+            "output_path": output_path,
+            "params": params,
+            "error": None,
+        }
+        self._jobs[job_id] = job
+        log_event(logger, "render_job.created", job_id=job_id, project_id=inp.project_id)
+        return Result.ok(CreateRenderJobOutput(
+            job_id=job_id,
+            project_id=inp.project_id,
+            status=RenderJobStatus.QUEUED.value,
+            output_path=output_path,
+            params=params,
+        ))
+
+    async def _validate_render_job(self, inp: ValidateRenderJobInput) -> Result[ValidateRenderJobOutput]:
+        errors: list[str] = []
+        warnings: list[str] = []
+        # Check output path safety.
+        if ".." in inp.output_path or "\x00" in inp.output_path:
+            errors.append(f"output path contains traversal or control chars: {inp.output_path}")
+        if inp.width < 1 or inp.height < 1:
+            errors.append(f"invalid dimensions: {inp.width}x{inp.height}")
+        if inp.fps <= 0 or inp.fps > 120:
+            errors.append(f"fps must be in (0, 120]; got {inp.fps}")
+        if inp.width != 1920 or inp.height != 1080:
+            warnings.append(f"non-standard resolution {inp.width}x{inp.height}; 1920x1080 recommended")
+        return Result.ok(ValidateRenderJobOutput(
+            valid=not errors,
+            output_path=inp.output_path,
+            errors=errors,
+            warnings=warnings,
+        ))
+
+    async def _render_video(self, inp: RenderVideoInput) -> Result[RenderVideoOutput]:
+        job = self._jobs.get(inp.job_id)
+        if job is None:
+            return Result.fail(f"render job not found: {inp.job_id}")
+
+        # Mark as running.
+        job["status"] = RenderJobStatus.RUNNING.value
+        params = job["params"]
+        log_event(logger, "render_job.started", job_id=inp.job_id)
+
+        try:
+            render_params = RenderJobParams(
+                output_path=params["output_filename"],
+                width=params["width"],
+                height=params["height"],
+                fps=params["fps"],
+                format=params["format"],
+                duration_sec=params.get("duration_sec"),
+                audio_path=params.get("audio_path"),
+            )
+            output_path = await self.ffmpeg.render(render_params)
+            job["status"] = RenderJobStatus.COMPLETED.value
+            job["output_path"] = output_path
+            log_event(logger, "render_job.completed", job_id=inp.job_id, output=output_path)
+            return Result.ok(RenderVideoOutput(
+                job_id=inp.job_id,
+                status=RenderJobStatus.COMPLETED.value,
+                output_path=output_path,
+            ))
+        except (AppError, RenderError) as exc:
+            job["status"] = RenderJobStatus.FAILED.value
+            job["error"] = str(exc)
+            log_event(logger, "render_job.failed", job_id=inp.job_id, error=str(exc))
+            return Result.fail(f"render failed: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = RenderJobStatus.FAILED.value
+            job["error"] = str(exc)
+            log_event(logger, "render_job.failed", job_id=inp.job_id, error=str(exc))
+            return Result.fail(f"render failed unexpectedly: {exc}")
+
+    async def _get_render_status(self, inp: GetRenderStatusInput) -> Result[GetRenderStatusOutput]:
+        job = self._jobs.get(inp.job_id)
+        if job is None:
+            return Result.fail(f"render job not found: {inp.job_id}")
+        return Result.ok(GetRenderStatusOutput(
+            job_id=inp.job_id,
+            status=job["status"],
+            output_path=job.get("output_path"),
+            error=job.get("error"),
+        ))
+
+    # --- legacy -------------------------------------------------------------
+
+    async def _probe_media(self, arguments: dict[str, Any]) -> Result[dict]:
+        """Probe a media file via ffprobe."""
         path = arguments.get("file_path", "")
         if not path or not str(path).strip():
             return self._fail("file_path is required")
-        # TODO(Phase 2): call ffprobe via app.services.ffmpeg.
-        return self._fail("ffprobe integration is not implemented in Phase 1")
+        try:
+            info = await self.ffmpeg.probe(path)
+            return self._ok({
+                "file_path": info.file_path,
+                "format": info.format,
+                "duration_sec": info.duration_sec,
+                "width": info.width,
+                "height": info.height,
+                "sample_rate": info.sample_rate,
+                "channels": info.channels,
+                "codec": info.codec,
+            })
+        except AppError as exc:
+            return self._fail(f"ffprobe failed: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            return self._fail(f"probe failed: {exc}")

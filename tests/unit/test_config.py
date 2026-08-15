@@ -43,10 +43,10 @@ def test_database_url_accepts_sqlite_and_postgres() -> None:
 def test_api_keys_present_does_not_expose_values() -> None:
     from app.config import Settings
 
-    settings = Settings(openai_api_key="sk-test", map_api_key="")
+    settings = Settings(openai_api_key="sk-test", google_maps_api_key="")
     present = settings.api_keys_present()
     assert present["openai"] is True
-    assert present["map"] is False
+    assert present["google_maps"] is False
     # The method returns booleans, never the raw key.
     assert all(isinstance(v, bool) for v in present.values())
 

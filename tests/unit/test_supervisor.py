@@ -50,7 +50,8 @@ async def test_supervisor_returns_failure_after_retries() -> None:
     from app.mcp.client import McpClient
 
     sup = SupervisorAgent(McpClient(), max_retries=1)
-    result = await sup.run_agent(AgentName.GEO, "geocode", {"query": "Paris"})
+    # An unknown tool always fails — tests the retry-then-give-up path.
+    result = await sup.run_agent(AgentName.SCRIPT, "nonexistent_tool", {"script_text": "hi"})
     assert not result.success
     assert result.attempt == 2  # 1 retry + initial
 

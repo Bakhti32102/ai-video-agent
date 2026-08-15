@@ -2,7 +2,7 @@
 
 from app.mcp.servers.assets.server import AssetMcpServer
 from app.mcp.servers.audio.server import AudioMcpServer
-from app.mcp.servers.base import BaseMcpServer
+from app.mcp.servers.base import BaseMcpServer, ToolDefinition
 from app.mcp.servers.geo.server import GeoMcpServer
 from app.mcp.servers.qa.server import QaMcpServer
 from app.mcp.servers.render.server import RenderMcpServer
@@ -21,5 +21,6 @@ __all__ = [
     "ScriptMcpServer",
     "SoundMcpServer",
     "TextMcpServer",
+    "ToolDefinition",
     "TransitionMcpServer",
 ]
